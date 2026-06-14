@@ -1,0 +1,11 @@
+^\.git$
+^\.DS_Store$
+^app\.R$
+^exports$
+^outputs$
+^scripts$
+^\.\.Rcheck$
+^SpatialOmicsMSI\.Rcheck$
+^SpatialOmicsMSI_.*\.tar\.gz$
+^.*\.Rproj$
+^\.Rproj\.user$

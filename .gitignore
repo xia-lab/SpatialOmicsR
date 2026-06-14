@@ -1,0 +1,21 @@
+.DS_Store
+.Rproj.user/
+*.Rproj
+
+# R build/check artifacts
+*.tar.gz
+*.Rcheck/
+..Rcheck/
+
+# Generated analysis outputs
+data/
+exports/
+outputs/
+
+# Local notes and development helpers not uploaded in the first clean package push
+docs/
+scripts/
+app.R
+
+# Local scratch or unrelated app experiments
+FanArtIOS/
