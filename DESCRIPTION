@@ -1,0 +1,30 @@
+Package: SpatialOmicsMSI
+Type: Package
+Title: Spatial MSI Feature Extraction and MetaboAnalyst Export
+Version: 0.3.1
+Authors@R: person("Spatial Omics", "Team", role = c("aut", "cre"), email = "noreply@example.com")
+Author: Spatial Omics Team
+Maintainer: Spatial Omics Team <noreply@example.com>
+Description: Utilities for targeted mass spectrometry imaging feature extraction,
+    feature selection, preprocessing, spatial clustering, sub-region sampling,
+    MetaboAnalyst export, MetaboAnalyst result import normalization, and spatial
+    back-mapping.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+Depends:
+    R (>= 4.1)
+Imports:
+    cluster,
+    grid,
+    stats,
+    utils
+Suggests:
+    Cardinal,
+    shiny,
+    ggplot2,
+    viridis,
+    DT,
+    tidyr,
+    tidyselect,
+    zip
