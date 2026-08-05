@@ -98,3 +98,79 @@ stopifnot(
   isTRUE(all.equal(registered_vertices$y, c(20, 20, 23), tolerance = 1e-10)),
   registration_diagnostics(registration)$rmse < 1e-10
 )
+
+# Control-point error cases
+too_few_points <- data.frame(
+  histology_x = c(0, 1),
+  histology_y = c(0, 0),
+  msi_x = c(10, 11),
+  msi_y = c(20, 20)
+)
+err_too_few <- tryCatch(
+  fit_histology_msi_registration(too_few_points),
+  error = function(e) e
+)
+stopifnot(inherits(err_too_few, "error"))
+
+collinear_points <- data.frame(
+  histology_x = c(0, 1, 2),
+  histology_y = c(0, 0, 0),
+  msi_x = c(10, 11, 12),
+  msi_y = c(20, 20, 20)
+)
+err_collinear <- tryCatch(
+  fit_histology_msi_registration(collinear_points),
+  error = function(e) e
+)
+stopifnot(inherits(err_collinear, "error"))
+
+# Section-aware histology registration with polygon ROI coordinates
+section_grid <- rbind(
+  transform(grid, section_id = "A", x = x + 10, y = y + 20, pixel_id = pixel_id),
+  transform(grid, section_id = "B", x = x + 20, y = y + 30, pixel_id = pixel_id + 1000)
+)
+control_points_section <- data.frame(
+  section_id = rep(c("A", "B"), each = 3),
+  histology_x = c(0, 1, 0, 0, 1, 0),
+  histology_y = c(0, 0, 1, 0, 0, 1),
+  msi_x = c(10, 11, 10, 20, 21, 20),
+  msi_y = c(20, 20, 21, 30, 30, 31)
+)
+registration_section <- fit_histology_msi_registration(control_points_section, section_column = "section_id")
+polygon_vertices <- data.frame(
+  section_id = c("A", "A", "A", "A", "B", "B", "B", "B"),
+  roi_id = c(rep("polyA", 4), rep("polyB", 4)),
+  vertex_order = rep(1:4, 2),
+  x = c(0, 2, 2, 0, 0, 2, 2, 0),
+  y = c(0, 0, 2, 2, 0, 0, 2, 2)
+)
+transformed_polygons <- transform_histology_coordinates(
+  polygon_vertices,
+  registration_section,
+  x_column = "x",
+  y_column = "y",
+  section_column = "section_id"
+)
+selected_section <- select_rois(
+  section_grid,
+  "manual",
+  "polygon",
+  polygon_vertices = transformed_polygons,
+  section_column = "section_id"
+)
+stopifnot(
+  nrow(selected_section$selected_pixels) > 0,
+  all(selected_section$selected_pixels$section_id %in% c("A", "B")),
+  all(c("polyA", "polyB") %in% unique(selected_section$selected_pixels$roi_id))
+)
+selected_samples <- sample_subregions(
+  selected_section$annotated_pixels,
+  grid_size = 2,
+  min_pixels = 1,
+  roi_column = "roi_id",
+  grid_scope = "roi"
+)
+stopifnot(
+  nrow(selected_samples$sample_matrix) > 0,
+  all(c("polyA", "polyB") %in% unique(selected_samples$sample_mapping$roi_id))
+)

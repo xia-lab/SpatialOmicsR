@@ -50,6 +50,18 @@ read_csv_upload <- function(upload) {
   data
 }
 
+validate_histology_control_points <- function(control_points) {
+  required_columns(
+    control_points,
+    c("histology_x", "histology_y", "msi_x", "msi_y"),
+    "H&E control points"
+  )
+  if ("section_id" %in% names(control_points)) {
+    control_points$section_id <- as.character(control_points$section_id)
+  }
+  control_points
+}
+
 preserve_uploaded_msi_files <- function(upload) {
   req(upload)
   temp_dir <- tempfile("msi_upload_")
@@ -312,7 +324,26 @@ ui <- fluidPage(
             ),
             conditionalPanel(
               "input.manual_roi_method == 'polygon_csv'",
-              fileInput("manual_polygon_upload", "Polygon vertices CSV", accept = ".csv")
+              fileInput("manual_polygon_upload", "Polygon vertices CSV", accept = ".csv"),
+              radioButtons(
+                "roi_coordinate_space",
+                "ROI coordinate space",
+                choices = c(
+                  "MSI coordinates" = "msi",
+                  "Histology coordinates" = "histology"
+                ),
+                selected = "msi",
+                inline = TRUE
+              ),
+              conditionalPanel(
+                "input.roi_coordinate_space == 'histology'",
+                fileInput("histology_control_points_upload", "H&E control points CSV", accept = ".csv"),
+                tags$small(
+                  "Control points CSV must contain histology_x, histology_y, msi_x, msi_y,",
+                  tags$br(),
+                  "and optional section_id for serial sections."
+                )
+              )
             )
           ),
           fluidRow(
@@ -323,7 +354,8 @@ ui <- fluidPage(
               actionButton("run_roi_sampling", "Confirm ROI & run sampling", class = "btn-primary"),
               uiOutput("roi_progress"),
               textOutput("roi_run_status"),
-              verbatimTextOutput("roi_status")
+              verbatimTextOutput("roi_status"),
+              verbatimTextOutput("registration_diagnostics")
             )
           ),
           tags$small("Manual serial ROI files must include section_id. Every mode produces roi_id plus pixel coordinates before sub-region sampling."),
@@ -367,6 +399,8 @@ ui <- fluidPage(
 server <- function(input, output, session) {
   last_thumbnail_dblclick <- reactiveVal(list(feature = NULL, time = as.POSIXct(0, origin = "1970-01-01")))
   manual_selected <- reactiveVal(character())
+  roi_run_status <- reactiveVal("Not run yet")
+  registration_info <- reactiveVal(NULL)
   last_metabo_export_path <- reactiveVal(NULL)
   extraction_status <- reactiveVal("Idle")
   extraction_progress_state <- reactiveVal(NULL)
@@ -1245,6 +1279,14 @@ server <- function(input, output, session) {
   })
 
   output$roi_run_status <- renderText(roi_run_status())
+  output$registration_diagnostics <- renderPrint({
+    info <- registration_info()
+    if (is.null(info)) {
+      cat("No registration diagnostics available.\n")
+    } else {
+      print(info)
+    }
+  })
 
   roi_sampling_stage <- eventReactive(input$run_roi_sampling, {
     roi_run_status("Running...")
@@ -1303,10 +1345,32 @@ server <- function(input, output, session) {
             validate(need(length(input$manual_roi_clusters) > 0, "Choose at least one cluster."))
           } else if (identical(backend_method, "geometry")) {
             validate(need(!is.null(geometry), "Upload an ROI geometry CSV."))
+            registration_info(NULL)
           } else if (identical(backend_method, "polygon")) {
             validate(need(!is.null(polygons), "Upload polygon vertices CSV."))
+            if (identical(input$roi_coordinate_space, "histology")) {
+              control_points <- read_csv_upload(input$histology_control_points_upload)
+              validate(need(!is.null(control_points), "Upload H&E control points CSV for histology coordinate mode."))
+              control_points <- validate_histology_control_points(control_points)
+              if ("section_id" %in% names(polygons) && !"section_id" %in% names(control_points)) {
+                stop("Polygon vertices contain section_id but control points do not. Add section_id to control points.", call. = FALSE)
+              }
+              section_col_reg <- if ("section_id" %in% names(control_points)) "section_id" else NULL
+              registration <- fit_histology_msi_registration(control_points, section_column = section_col_reg)
+              polygons <- transform_histology_coordinates(
+                polygons,
+                registration,
+                x_column = "x",
+                y_column = "y",
+                section_column = section_col_reg
+              )
+              registration_info(registration_diagnostics(registration))
+            } else {
+              registration_info(NULL)
+            }
           } else {
             validate(need(nrow(geometry) + nrow(polygons) > 0, "Draw and add at least one ROI."))
+            registration_info(NULL)
           }
           setProgress(0.3, detail = "Mapping drawn ROI to pixels")
           update_stage_progress(roi_progress_state, 0.3, "Mapping drawn ROI to pixels")
@@ -1318,7 +1382,7 @@ server <- function(input, output, session) {
             selected_clusters = input$manual_roi_clusters,
             roi_table = geometry,
             polygon_vertices = polygons,
-            section_column = section_col,
+            section_column = if ("section_id" %in% names(polygons)) "section_id" else section_col,
             overlap = "first"
           )
         }
