@@ -302,64 +302,213 @@ detect_ubiquitous_features <- function(pixel_matrix,
   )
 }
 
-compute_morans_i_grid <- function(values,
-                                  x,
-                                  y,
-                                  n_perm = 0,
-                                  alternative = c("greater", "two.sided"),
-                                  seed = NULL) {
-  alternative <- match.arg(alternative)
-  keep <- is.finite(values) & is.finite(x) & is.finite(y)
-  values <- as.numeric(values[keep])
-  x <- x[keep]
-  y <- y[keep]
-  n <- length(values)
-  if (n < 3 || stats::var(values, na.rm = TRUE) == 0) {
-    return(list(I = 0, p_value = NA_real_, n = n, n_edges = 0L))
+build_spatial_neighbors <- function(x,
+                                    y,
+                                    method = c("rook", "queen", "distance"),
+                                    distance_threshold = NULL,
+                                    weights = c("binary"),
+                                    symmetric = TRUE) {
+  method <- match.arg(method)
+  weights <- match.arg(weights)
+  x <- as.numeric(x)
+  y <- as.numeric(y)
+  if (length(x) != length(y) || length(x) == 0L) {
+    stop("x and y must have the same positive length.", call. = FALSE)
+  }
+  if (any(!is.finite(x) | !is.finite(y))) {
+    stop("Spatial coordinates must be finite and non-missing.", call. = FALSE)
+  }
+  if (anyDuplicated(paste(x, y, sep = "\r"))) {
+    stop("Spatial coordinates must be unique.", call. = FALSE)
+  }
+  if (length(symmetric) != 1L || is.na(symmetric)) {
+    stop("symmetric must be TRUE or FALSE.", call. = FALSE)
+  }
+  symmetric <- isTRUE(symmetric)
+  default_threshold <- switch(method, rook = 1, queen = sqrt(2), distance = NA_real_)
+  if (is.null(distance_threshold)) distance_threshold <- default_threshold
+  if (length(distance_threshold) != 1L || !is.finite(distance_threshold) || distance_threshold <= 0) {
+    stop("distance_threshold must be supplied as one positive finite value.", call. = FALSE)
   }
 
-  coords <- data.frame(
-    idx = seq_len(n),
-    x = x,
-    y = y,
-    key = paste(x, y, sep = "\r"),
-    right_key = paste(x + 1, y, sep = "\r"),
-    down_key = paste(x, y + 1, sep = "\r"),
+  n_nodes <- length(x)
+  edge_from <- integer()
+  edge_to <- integer()
+  edge_distance <- numeric()
+  if (method %in% c("rook", "queen")) {
+    offsets <- if (method == "rook") {
+      data.frame(dx = c(1, 0), dy = c(0, 1))
+    } else {
+      data.frame(dx = c(1, 0, 1, 1), dy = c(0, 1, 1, -1))
+    }
+    offsets$distance <- sqrt(offsets$dx^2 + offsets$dy^2)
+    offsets <- offsets[offsets$distance <= distance_threshold + sqrt(.Machine$double.eps), , drop = FALSE]
+    key_to_index <- stats::setNames(seq_len(n_nodes), paste(x, y, sep = "\r"))
+    for (offset_index in seq_len(nrow(offsets))) {
+      neighbor_index <- unname(key_to_index[paste(x + offsets$dx[offset_index], y + offsets$dy[offset_index], sep = "\r")])
+      present <- !is.na(neighbor_index)
+      edge_from <- c(edge_from, which(present))
+      edge_to <- c(edge_to, neighbor_index[present])
+      edge_distance <- c(edge_distance, rep(offsets$distance[offset_index], sum(present)))
+    }
+  } else if (n_nodes >= 2L) {
+    from_rows <- vector("list", n_nodes - 1L)
+    to_rows <- vector("list", n_nodes - 1L)
+    distance_rows <- vector("list", n_nodes - 1L)
+    for (i in seq_len(n_nodes - 1L)) {
+      candidates <- seq.int(i + 1L, n_nodes)
+      distances <- sqrt((x[candidates] - x[i])^2 + (y[candidates] - y[i])^2)
+      keep <- distances <= distance_threshold + sqrt(.Machine$double.eps)
+      from_rows[[i]] <- rep.int(i, sum(keep))
+      to_rows[[i]] <- candidates[keep]
+      distance_rows[[i]] <- distances[keep]
+    }
+    edge_from <- unlist(from_rows, use.names = FALSE)
+    edge_to <- unlist(to_rows, use.names = FALSE)
+    edge_distance <- unlist(distance_rows, use.names = FALSE)
+  }
+  if (any(edge_from == edge_to)) stop("Internal error: neighbor graph contains a self-loop.", call. = FALSE)
+  undirected_edges <- data.frame(
+    from = as.integer(edge_from), to = as.integer(edge_to),
+    distance = as.numeric(edge_distance), weight = rep(1, length(edge_from)),
     stringsAsFactors = FALSE
   )
-  key_to_idx <- stats::setNames(coords$idx, coords$key)
-  right_idx <- unname(key_to_idx[coords$right_key])
-  down_idx <- unname(key_to_idx[coords$down_key])
+  directed_edges <- if (symmetric && nrow(undirected_edges) > 0L) {
+    rbind(undirected_edges, data.frame(
+      from = undirected_edges$to, to = undirected_edges$from,
+      distance = undirected_edges$distance, weight = undirected_edges$weight,
+      stringsAsFactors = FALSE
+    ))
+  } else undirected_edges
+  degree <- tabulate(c(undirected_edges$from, undirected_edges$to), nbins = n_nodes)
+  effective <- degree > 0L
 
-  edge_i <- c(coords$idx[!is.na(right_idx)], coords$idx[!is.na(down_idx)])
-  edge_j <- c(right_idx[!is.na(right_idx)], down_idx[!is.na(down_idx)])
-  n_edges <- length(edge_i)
-  if (n_edges == 0) {
-    return(list(I = 0, p_value = NA_real_, n = n, n_edges = 0L))
+  adjacency <- vector("list", n_nodes)
+  if (nrow(undirected_edges) > 0L) {
+    for (edge_index in seq_len(nrow(undirected_edges))) {
+      a <- undirected_edges$from[edge_index]; b <- undirected_edges$to[edge_index]
+      adjacency[[a]] <- c(adjacency[[a]], b)
+      adjacency[[b]] <- c(adjacency[[b]], a)
+    }
   }
+  component_id <- integer(n_nodes)
+  component_sizes <- integer()
+  component_count <- 0L
+  for (start in seq_len(n_nodes)) {
+    if (component_id[start] != 0L) next
+    component_count <- component_count + 1L
+    queue <- integer(n_nodes); queue[1] <- start
+    component_id[start] <- component_count
+    head <- 1L; tail <- 1L; size <- 0L
+    while (head <= tail) {
+      node <- queue[head]; head <- head + 1L; size <- size + 1L
+      for (neighbor in adjacency[[node]]) {
+        if (component_id[neighbor] == 0L) {
+          tail <- tail + 1L; queue[tail] <- neighbor
+          component_id[neighbor] <- component_count
+        }
+      }
+    }
+    component_sizes[component_count] <- size
+  }
+  degree_distribution <- as.data.frame(table(degree), stringsAsFactors = FALSE)
+  names(degree_distribution) <- c("degree", "node_count")
+  degree_distribution$degree <- as.integer(as.character(degree_distribution$degree))
+  component_table <- data.frame(
+    component_id = seq_along(component_sizes), component_size = component_sizes,
+    contains_edge = component_sizes > 1L, stringsAsFactors = FALSE
+  )
+  summary <- data.frame(
+    method = method, weights = weights, symmetric = symmetric,
+    n_nodes = n_nodes, n_effective = sum(effective), n_isolated = sum(!effective),
+    isolated_proportion = mean(!effective), n_edges_undirected = nrow(undirected_edges),
+    connected_component_count = length(component_sizes),
+    effective_component_count = sum(component_sizes > 1L),
+    distance_threshold = distance_threshold,
+    includes_diagonal_neighbors = method == "queen" && distance_threshold >= sqrt(2) - sqrt(.Machine$double.eps),
+    stringsAsFactors = FALSE
+  )
+  structure(list(
+    edges = directed_edges, undirected_edges = undirected_edges,
+    degree = degree, effective = effective, component_id = component_id,
+    component_sizes = component_table, degree_distribution = degree_distribution,
+    summary = summary, x = x, y = y, method = method, weights = weights,
+    symmetric = symmetric, distance_threshold = distance_threshold
+  ), class = "spatial_neighbors")
+}
 
+spatial_neighbor_diagnostics <- function(neighbors) {
+  if (!inherits(neighbors, "spatial_neighbors")) stop("neighbors must come from build_spatial_neighbors().", call. = FALSE)
+  summary_rows <- data.frame(
+    section = "summary", metric = names(neighbors$summary),
+    value = vapply(neighbors$summary, function(value) as.character(value[1]), character(1)),
+    stringsAsFactors = FALSE
+  )
+  degree_rows <- data.frame(
+    section = "degree_distribution",
+    metric = paste0("degree_", neighbors$degree_distribution$degree),
+    value = as.character(neighbors$degree_distribution$node_count), stringsAsFactors = FALSE
+  )
+  component_rows <- data.frame(
+    section = "component_sizes",
+    metric = sprintf("component_%04d", neighbors$component_sizes$component_id),
+    value = as.character(neighbors$component_sizes$component_size), stringsAsFactors = FALSE
+  )
+  rbind(summary_rows, degree_rows, component_rows)
+}
+
+compute_morans_i_grid <- function(values,
+                                  x = NULL,
+                                  y = NULL,
+                                  n_perm = 0,
+                                  alternative = c("greater", "two.sided"),
+                                  seed = NULL,
+                                  neighbors = NULL,
+                                  neighbor_method = c("rook", "queen", "distance"),
+                                  distance_threshold = NULL,
+                                  weights = "binary",
+                                  symmetric = TRUE) {
+  alternative <- match.arg(alternative)
+  neighbor_method <- match.arg(neighbor_method)
+  values <- as.numeric(values)
+  if (is.null(neighbors)) {
+    if (is.null(x) || is.null(y)) stop("x and y are required when neighbors is NULL.", call. = FALSE)
+    neighbors <- build_spatial_neighbors(x, y, method = neighbor_method,
+      distance_threshold = distance_threshold, weights = weights, symmetric = symmetric)
+  }
+  if (!inherits(neighbors, "spatial_neighbors")) stop("neighbors must come from build_spatial_neighbors().", call. = FALSE)
+  n_total <- length(values)
+  if (n_total != length(neighbors$x)) stop("values must contain one value per spatial-neighbor node.", call. = FALSE)
+  edges <- neighbors$undirected_edges
+  finite <- is.finite(values)
+  if (nrow(edges) > 0L) edges <- edges[finite[edges$from] & finite[edges$to], , drop = FALSE]
+  degree <- tabulate(c(edges$from, edges$to), nbins = n_total)
+  effective <- finite & degree > 0L
+  n_effective <- sum(effective); n_isolated <- n_total - n_effective; n_edges <- nrow(edges)
+  if (n_edges == 0L) stop("Moran's I is undefined because the effective graph has no edges.", call. = FALSE)
+  if (n_effective < 3L) stop("Moran's I requires at least three non-isolated finite nodes.", call. = FALSE)
+  index_map <- integer(n_total); index_map[effective] <- seq_len(n_effective)
+  edge_i <- index_map[edges$from]; edge_j <- index_map[edges$to]; edge_weight <- edges$weight
+  effective_values <- values[effective]
   moran_stat <- function(v) {
-    centered <- v - mean(v, na.rm = TRUE)
-    denom <- sum(centered^2, na.rm = TRUE)
-    if (!is.finite(denom) || denom == 0) return(0)
-    numerator <- 2 * sum(centered[edge_i] * centered[edge_j], na.rm = TRUE)
-    w <- 2 * n_edges
-    (n / w) * numerator / denom
+    centered <- v - mean(v); denominator <- sum(centered^2)
+    if (!is.finite(denominator) || denominator == 0) return(NA_real_)
+    numerator <- 2 * sum(edge_weight * centered[edge_i] * centered[edge_j])
+    (n_effective / (2 * sum(edge_weight))) * numerator / denominator
   }
-
-  observed <- moran_stat(values)
+  observed <- moran_stat(effective_values)
   p_value <- NA_real_
-  if (n_perm > 0) {
+  if (n_perm > 0L && is.finite(observed)) {
     if (!is.null(seed)) set.seed(seed)
-    permuted <- replicate(n_perm, moran_stat(sample(values, length(values), replace = FALSE)))
+    permuted <- replicate(as.integer(n_perm), moran_stat(sample(effective_values, n_effective, replace = FALSE)))
     if (alternative == "greater") {
       p_value <- (sum(permuted >= observed, na.rm = TRUE) + 1) / (sum(is.finite(permuted)) + 1)
     } else {
       p_value <- (sum(abs(permuted) >= abs(observed), na.rm = TRUE) + 1) / (sum(is.finite(permuted)) + 1)
     }
   }
-
-  list(I = observed, p_value = p_value, n = n, n_edges = n_edges)
+  list(I = observed, p_value = p_value, n = n_effective, n_total = n_total,
+    n_effective = n_effective, n_isolated = n_isolated, n_edges = n_edges)
 }
 
 compare_contamination_methods <- function(pixel_matrix,
@@ -2937,8 +3086,14 @@ compute_spatially_variable_metabolites <- function(pixel_matrix,
                                                    n_perm = 199,
                                                    alternative = c("greater", "two.sided"),
                                                    p_adjust_method = "BH",
-                                                   seed = NULL) {
+                                                   seed = NULL,
+                                                   neighbors = NULL,
+                                                   neighbor_method = c("rook", "queen", "distance"),
+                                                   distance_threshold = NULL,
+                                                   weights = "binary",
+                                                   symmetric = TRUE) {
   alternative <- match.arg(alternative)
+  neighbor_method <- match.arg(neighbor_method)
   if (length(fcols) == 0) {
     stop("No mz_ features found for spatial analysis.", call. = FALSE)
   }
@@ -2961,6 +3116,13 @@ compute_spatially_variable_metabolites <- function(pixel_matrix,
     coords <- pixel_matrix[, c("pixel_id", x_col, y_col), drop = FALSE]
   }
 
+  if (is.null(neighbors)) {
+    neighbors <- build_spatial_neighbors(
+      coords[[x_col]], coords[[y_col]], method = neighbor_method,
+      distance_threshold = distance_threshold, weights = weights, symmetric = symmetric
+    )
+  }
+
   if (!is.null(seed)) set.seed(seed)
   rows <- lapply(fcols, function(feature) {
     stat <- compute_morans_i_grid(
@@ -2969,13 +3131,17 @@ compute_spatially_variable_metabolites <- function(pixel_matrix,
       y = coords[[y_col]],
       n_perm = n_perm,
       alternative = alternative,
-      seed = NULL
+      seed = NULL,
+      neighbors = neighbors
     )
     data.frame(
       feature = feature,
       morans_i = stat$I,
       p_value = stat$p_value,
       n = stat$n,
+      n_total = stat$n_total,
+      n_effective = stat$n_effective,
+      n_isolated = stat$n_isolated,
       n_edges = stat$n_edges,
       stringsAsFactors = FALSE
     )
@@ -3183,11 +3349,15 @@ plot_ion_image <- function(pixel_matrix,
     y = pixel_matrix$y,
     intensity = values
   )
+  x_steps <- diff(sort(unique(plot_data$x)))
+  y_steps <- diff(sort(unique(plot_data$y)))
+  tile_width <- if (any(x_steps > 0)) min(x_steps[x_steps > 0]) else 1
+  tile_height <- if (any(y_steps > 0)) min(y_steps[y_steps > 0]) else 1
 
   if (is.null(title)) title <- column_name
 
   ggplot2::ggplot(plot_data, ggplot2::aes(x = .data[["x"]], y = .data[["y"]], fill = .data[["intensity"]])) +
-    ggplot2::geom_raster() +
+    ggplot2::geom_tile(width = tile_width, height = tile_height) +
     ggplot2::coord_fixed() +
     viridis::scale_fill_viridis(option = "viridis") +
     ggplot2::labs(title = title, x = "x", y = "y", fill = "Intensity") +
