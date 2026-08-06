@@ -2387,6 +2387,283 @@ cross_validate_annotations <- function(feature_csv,
   result
 }
 
+run_spatial_metabolomics_pipeline <- function(msi_csv,
+                                              x_col = "x",
+                                              y_col = "y",
+                                              bad_pixel_filter = TRUE,
+                                              min_nonzero_count = 1,
+                                              tic_normalize = TRUE,
+                                              do_log = TRUE,
+                                              do_scale = FALSE) {
+  if (!file.exists(msi_csv)) {
+    stop("MSI CSV file does not exist: ", msi_csv, call. = FALSE)
+  }
+
+  pixel_matrix <- import_peakpicked_msi_csv(msi_csv)
+  required_columns(pixel_matrix, c(x_col, y_col), "MSI pixel matrix")
+  fcols <- feature_columns(pixel_matrix)
+  if (length(fcols) < 5) {
+    stop("MSI data must contain at least 5 mz_ feature columns.", call. = FALSE)
+  }
+
+  coords <- pixel_matrix[, c(x_col, y_col), drop = FALSE]
+  if (!all(is.finite(coords[[x_col]]) & is.finite(coords[[y_col]]))) {
+    stop("MSI coordinates must be finite.", call. = FALSE)
+  }
+
+  values <- as.matrix(pixel_matrix[fcols])
+  if (!all(is.finite(values))) {
+    values[!is.finite(values)] <- 0
+  }
+
+  keep <- rep(TRUE, nrow(pixel_matrix))
+  if (isTRUE(bad_pixel_filter)) {
+    keep <- rowSums(values > 0, na.rm = TRUE) >= min_nonzero_count
+  }
+  filtered <- pixel_matrix[keep, , drop = FALSE]
+  qc_summary <- list(
+    raw_pixels = nrow(pixel_matrix),
+    retained_pixels = nrow(filtered),
+    removed_pixels = nrow(pixel_matrix) - nrow(filtered),
+    input_feature_count = length(fcols),
+    output_feature_count = length(fcols),
+    feature_count = length(fcols)
+  )
+
+  if (nrow(filtered) == 0) {
+    stop("No pixels remain after QC filtering.", call. = FALSE)
+  }
+
+  feature_meta <- data.frame(
+    feature_id = seq_along(fcols),
+    column_name = fcols,
+    mz = suppressWarnings(as.numeric(sub("^mz_", "", fcols))),
+    stringsAsFactors = FALSE
+  )
+
+  normalized <- as.matrix(filtered[fcols])
+  if (isTRUE(tic_normalize)) {
+    row_totals <- rowSums(normalized, na.rm = TRUE)
+    normalized <- sweep(normalized, 1, pmax(row_totals, .Machine$double.eps), "/")
+  }
+  if (isTRUE(do_log)) {
+    normalized <- log10(normalized + 1)
+  }
+  if (isTRUE(do_scale) && ncol(normalized) > 1) {
+    normalized <- scale(normalized, center = TRUE, scale = TRUE)
+    normalized[!is.finite(normalized)] <- 0
+  }
+
+  pixel_feature_matrix <- as.data.frame(normalized, stringsAsFactors = FALSE)
+  pixel_feature_matrix$pixel_id <- filtered$pixel_id
+  pixel_feature_matrix <- pixel_feature_matrix[, c("pixel_id", fcols), drop = FALSE]
+  coordinates <- filtered[, c("pixel_id", x_col, y_col), drop = FALSE]
+  if ("section_id" %in% names(filtered)) {
+    coordinates$section_id <- filtered$section_id
+  }
+  coordinates <- coordinates[, intersect(c("pixel_id", x_col, y_col, "section_id"), names(coordinates)), drop = FALSE]
+
+  list(
+    pixel_feature_matrix = pixel_feature_matrix,
+    coordinates = coordinates,
+    feature_metadata = feature_meta,
+    qc_summary = qc_summary,
+    parameters = list(
+      x_col = x_col,
+      y_col = y_col,
+      bad_pixel_filter = bad_pixel_filter,
+      min_nonzero_count = min_nonzero_count,
+      tic_normalize = tic_normalize,
+      do_log = do_log,
+      do_scale = do_scale
+    )
+  )
+}
+
+compute_spatially_variable_metabolites <- function(pixel_matrix,
+                                                   coordinates = NULL,
+                                                   x_col = "x",
+                                                   y_col = "y",
+                                                   fcols = feature_columns(pixel_matrix),
+                                                   n_perm = 199,
+                                                   alternative = c("greater", "two.sided"),
+                                                   p_adjust_method = "BH",
+                                                   seed = NULL) {
+  alternative <- match.arg(alternative)
+  if (length(fcols) == 0) {
+    stop("No mz_ features found for spatial analysis.", call. = FALSE)
+  }
+
+  if (!is.null(coordinates)) {
+    required_columns(pixel_matrix, "pixel_id", "Pixel matrix")
+    required_columns(coordinates, c("pixel_id", x_col, y_col), "Coordinates")
+    coords <- merge(
+      pixel_matrix["pixel_id", drop = FALSE],
+      coordinates[, c("pixel_id", x_col, y_col), drop = FALSE],
+      by = "pixel_id",
+      sort = FALSE
+    )
+    if (nrow(coords) != nrow(pixel_matrix)) {
+      stop("Coordinates must contain the same pixel_id values as pixel_matrix.", call. = FALSE)
+    }
+    coords <- coords[match(pixel_matrix$pixel_id, coords$pixel_id), , drop = FALSE]
+  } else {
+    required_columns(pixel_matrix, c("pixel_id", x_col, y_col), "Pixel matrix")
+    coords <- pixel_matrix[, c("pixel_id", x_col, y_col), drop = FALSE]
+  }
+
+  if (!is.null(seed)) set.seed(seed)
+  rows <- lapply(fcols, function(feature) {
+    stat <- compute_morans_i_grid(
+      values = pixel_matrix[[feature]],
+      x = coords[[x_col]],
+      y = coords[[y_col]],
+      n_perm = n_perm,
+      alternative = alternative,
+      seed = NULL
+    )
+    data.frame(
+      feature = feature,
+      morans_i = stat$I,
+      p_value = stat$p_value,
+      n = stat$n,
+      n_edges = stat$n_edges,
+      stringsAsFactors = FALSE
+    )
+  })
+  result <- do.call(rbind, rows)
+  result$adj_p_value <- stats::p.adjust(result$p_value, method = p_adjust_method)
+  result[order(result$adj_p_value, -abs(result$morans_i)), , drop = FALSE]
+}
+
+cross_validate_msi_lcms <- function(msi_features,
+                                    lcms_features,
+                                    msi_mz_col = "mz",
+                                    lcms_mz_col = "mz",
+                                    msi_mode_col = "ion_mode",
+                                    lcms_mode_col = "ion_mode",
+                                    msi_log2fc_col = "log2fc",
+                                    lcms_log2fc_col = "log2fc",
+                                    lcms_id_col = c("id", "compound_id", "feature_id", "name"),
+                                    lcms_name_col = c("name", "compound", "compound_name"),
+                                    lcms_rt_col = c("rt", "retention_time"),
+                                    ppm = 5) {
+  if (!is.data.frame(msi_features) || !is.data.frame(lcms_features)) {
+    stop("Both MSI features and LC-MS features must be data frames.", call. = FALSE)
+  }
+
+  msi_mz_col <- first_existing_column(msi_features, msi_mz_col, "MSI m/z column")
+  lcms_mz_col <- first_existing_column(lcms_features, lcms_mz_col, "LC-MS m/z column")
+  required_columns(msi_features, c(msi_mz_col), "MSI feature table")
+  required_columns(lcms_features, c(lcms_mz_col), "LC-MS feature table")
+
+  choose_optional <- function(data, candidates) {
+    cols <- candidates[candidates %in% names(data)]
+    if (length(cols) > 0) cols[1] else NULL
+  }
+
+  msi_mode_col <- choose_optional(msi_features, msi_mode_col)
+  lcms_mode_col <- choose_optional(lcms_features, lcms_mode_col)
+  msi_log2fc_col <- choose_optional(msi_features, msi_log2fc_col)
+  lcms_log2fc_col <- choose_optional(lcms_features, lcms_log2fc_col)
+  lcms_id_col <- choose_optional(lcms_features, lcms_id_col)
+  lcms_name_col <- choose_optional(lcms_features, lcms_name_col)
+  lcms_rt_col <- choose_optional(lcms_features, lcms_rt_col)
+
+  msi_mz <- suppressWarnings(as.numeric(msi_features[[msi_mz_col]]))
+  lcms_mz <- suppressWarnings(as.numeric(lcms_features[[lcms_mz_col]]))
+  if (any(!is.finite(msi_mz))) {
+    stop("MSI m/z values must be numeric and finite.", call. = FALSE)
+  }
+  if (any(!is.finite(lcms_mz))) {
+    stop("LC-MS m/z values must be numeric and finite.", call. = FALSE)
+  }
+
+  mode_match <- !is.null(msi_mode_col) && !is.null(lcms_mode_col)
+  used_lcms <- rep(FALSE, nrow(lcms_features))
+  rows <- list()
+
+  for (i in seq_len(nrow(msi_features))) {
+    mz <- msi_mz[i]
+    candidate_idx <- which(!used_lcms)
+    if (mode_match) {
+      candidate_idx <- candidate_idx[lcms_features[[lcms_mode_col]][candidate_idx] == msi_features[[msi_mode_col]][i]]
+    }
+    if (length(candidate_idx) == 0) next
+
+    ppm_error <- abs(lcms_mz[candidate_idx] - mz) / mz * 1e6
+    # Allow a tiny numerical tolerance to account for floating-point rounding
+    # when comparing ppm errors to the threshold.
+    within <- which(ppm_error <= (ppm + (.Machine$double.eps * 1e6)))
+    if (length(within) == 0) next
+
+    chosen <- candidate_idx[within[which.min(ppm_error[within])]]
+    used_lcms[chosen] <- TRUE
+
+    msi_log2fc <- if (!is.null(msi_log2fc_col)) suppressWarnings(as.numeric(msi_features[[msi_log2fc_col]][i])) else NA_real_
+    lcms_log2fc <- if (!is.null(lcms_log2fc_col)) suppressWarnings(as.numeric(lcms_features[[lcms_log2fc_col]][chosen])) else NA_real_
+    direction_agreement <- NA
+    if (is.finite(msi_log2fc) && is.finite(lcms_log2fc)) {
+      direction_agreement <- sign(msi_log2fc) == sign(lcms_log2fc)
+    }
+
+    msi_id <- if ("feature_id" %in% names(msi_features)) as.character(msi_features$feature_id[i]) else NA_character_
+    lcms_id <- if (!is.null(lcms_id_col)) as.character(lcms_features[[lcms_id_col]][chosen]) else NA_character_
+    lcms_name <- if (!is.null(lcms_name_col)) as.character(lcms_features[[lcms_name_col]][chosen]) else NA_character_
+    match_type <- if (!is.na(msi_id) && !is.na(lcms_id) && nzchar(msi_id) && nzchar(lcms_id) && identical(msi_id, lcms_id)) {
+      "confirmed"
+    } else {
+      "putative"
+    }
+    lcms_rt <- if (!is.null(lcms_rt_col)) lcms_features[[lcms_rt_col]][chosen] else NA_real_
+
+    rows[[length(rows) + 1L]] <- data.frame(
+      msi_feature_id = if ("feature_id" %in% names(msi_features)) as.character(msi_features$feature_id[i]) else NA_character_,
+      msi_mz = mz,
+      lcms_feature_id = if (!is.null(lcms_id_col)) as.character(lcms_features[[lcms_id_col]][chosen]) else NA_character_,
+      lcms_mz = lcms_mz[chosen],
+      ion_mode = if (mode_match) as.character(msi_features[[msi_mode_col]][i]) else NA_character_,
+      ppm_error = ppm_error[within[which.min(ppm_error[within])]],
+      msi_log2fc = msi_log2fc,
+      lcms_log2fc = lcms_log2fc,
+      direction_agreement = direction_agreement,
+      match_type = match_type,
+      lcms_rt = if (!is.null(lcms_rt_col)) lcms_rt else NA_real_,
+      lcms_name = lcms_name,
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )
+  }
+
+  result <- if (length(rows) > 0) do.call(rbind, rows) else structure(data.frame(
+    msi_feature_id = character(),
+    msi_mz = numeric(),
+    lcms_feature_id = character(),
+    lcms_mz = numeric(),
+    ion_mode = character(),
+    ppm_error = numeric(),
+    msi_log2fc = numeric(),
+    lcms_log2fc = numeric(),
+    direction_agreement = logical(),
+    match_type = character(),
+    lcms_rt = numeric(),
+    lcms_name = character(),
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  ), class = "data.frame")
+
+  summary <- data.frame(
+    total_msi_features = nrow(msi_features),
+    matched_features = nrow(result),
+    confirmed_matches = sum(result$match_type == "confirmed", na.rm = TRUE),
+    putative_matches = sum(result$match_type == "putative", na.rm = TRUE),
+    agreement_rate = if (nrow(result) == 0) NA_real_ else sum(result$direction_agreement == TRUE, na.rm = TRUE) / sum(!is.na(result$direction_agreement)),
+    stringsAsFactors = FALSE
+  )
+  attr(result, "summary") <- summary
+  result
+}
+
 backmap_sample_scores <- function(score_data, sample_mapping, score_column) {
   required_columns(score_data, c("Sample", score_column), "Score data")
   required_columns(sample_mapping, c("sample_id", "pixel_ids"), "Sample mapping")
