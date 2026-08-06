@@ -805,6 +805,281 @@ load_msi_target_features <- function(imzml_path,
   list(pixel_matrix = pixel_matrix, feature_mapping = mapping)
 }
 
+stable_mz_column_names <- function(mz_values) {
+  labels <- vapply(mz_values, function(value) {
+    format(value, digits = 17, scientific = FALSE, trim = TRUE)
+  }, character(1))
+  make.unique(paste0("mz_", labels), sep = "_feature_")
+}
+
+orient_shared_intensity_matrix <- function(intensity_data, n_features, n_spectra) {
+  intensity_dim <- dim(intensity_data)
+  if (length(intensity_dim) != 2L) {
+    stop("Shared-axis centroided intensity data must be a two-dimensional matrix.", call. = FALSE)
+  }
+  feature_by_spectrum <- identical(as.integer(intensity_dim), c(as.integer(n_features), as.integer(n_spectra)))
+  spectrum_by_feature <- identical(as.integer(intensity_dim), c(as.integer(n_spectra), as.integer(n_features)))
+  if (feature_by_spectrum && spectrum_by_feature) {
+    warning(
+      "Ambiguous square intensity matrix; assuming features x spectra.",
+      call. = FALSE
+    )
+    spectrum_by_feature <- FALSE
+  }
+  if (!feature_by_spectrum && !spectrum_by_feature) {
+    stop(
+      "Intensity dimensions ", paste(intensity_dim, collapse = " x "),
+      " do not match ", n_features, " shared m/z features and ", n_spectra, " spectra.",
+      call. = FALSE
+    )
+  }
+  values <- as.matrix(intensity_data)
+  if (feature_by_spectrum) {
+    values <- t(values)
+    orientation <- "features_x_spectra"
+  } else {
+    orientation <- "spectra_x_features"
+  }
+  storage.mode(values) <- "double"
+  list(values = values, source_orientation = orientation)
+}
+
+load_centroided_msi_features <- function(imzml_path,
+                                         sample_id = NULL,
+                                         section_id = NULL,
+                                         ion_mode = NULL,
+                                         ion_mode_source = NULL) {
+  if (!is.character(imzml_path) || length(imzml_path) != 1L || !nzchar(imzml_path)) {
+    stop("imzml_path must be one non-empty path.", call. = FALSE)
+  }
+  imzml_path <- normalizePath(imzml_path, mustWork = TRUE)
+  extension <- tools::file_ext(imzml_path)
+  if (tolower(extension) != "imzml") {
+    stop("imzml_path must point to an .imzML file.", call. = FALSE)
+  }
+  ibd_path <- paste0(substr(imzml_path, 1L, nchar(imzml_path) - nchar(extension)), "ibd")
+  if (!file.exists(ibd_path) || !isTRUE(file.info(ibd_path)$isdir == FALSE)) {
+    stop("The companion .ibd file does not exist: ", ibd_path, call. = FALSE)
+  }
+  validate_scalar_text <- function(value, label) {
+    if (missing(value) || is.null(value) || length(value) != 1L || is.na(value) || !nzchar(trimws(value))) {
+      stop(label, " must be supplied explicitly as one non-empty value.", call. = FALSE)
+    }
+    as.character(value)
+  }
+  sample_id <- validate_scalar_text(sample_id, "sample_id")
+  section_id <- validate_scalar_text(section_id, "section_id")
+  ion_mode <- validate_scalar_text(ion_mode, "ion_mode")
+  ion_mode_source <- validate_scalar_text(ion_mode_source, "ion_mode_source")
+  if (!ion_mode %in% c("positive", "negative")) {
+    stop("ion_mode must be either 'positive' or 'negative'.", call. = FALSE)
+  }
+  if (!requireNamespace("Cardinal", quietly = TRUE)) {
+    stop("Package 'Cardinal' is required for imzML loading.", call. = FALSE)
+  }
+
+  msi <- Cardinal::readMSIData(imzml_path)
+  experiment <- Cardinal::experimentData(msi)
+  spectrum_type <- as.character(experiment$spectrumType)
+  if (length(spectrum_type) != 1L || !identical(spectrum_type, "MS1 spectrum")) {
+    stop(
+      "Only MS1 imzML data are supported; observed spectrum type: ",
+      paste(spectrum_type, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  if (!isTRUE(Cardinal::isCentroided(msi))) {
+    stop("The imzML data must be centroided.", call. = FALSE)
+  }
+
+  coordinates <- as.data.frame(Cardinal::coord(msi))
+  required_columns(coordinates, c("x", "y"), "Cardinal coordinates")
+  if (any(!is.finite(coordinates$x) | !is.finite(coordinates$y))) {
+    stop("MSI coordinates must be finite and non-missing.", call. = FALSE)
+  }
+  if (any(duplicated(coordinates[, c("x", "y"), drop = FALSE]))) {
+    stop("MSI coordinates must be unique within a sample.", call. = FALSE)
+  }
+
+  mz_data <- Cardinal::mz(msi)
+  if (is_list_like_spectra(mz_data) || !is.null(dim(mz_data))) {
+    stop("The imzML data do not have one shared m/z axis.", call. = FALSE)
+  }
+  mz_values <- as.numeric(mz_data)
+  if (!length(mz_values) || any(!is.finite(mz_values))) {
+    stop("The shared m/z axis is empty or contains non-finite values.", call. = FALSE)
+  }
+  oriented <- orient_shared_intensity_matrix(
+    Cardinal::intensity(msi),
+    n_features = length(mz_values),
+    n_spectra = nrow(coordinates)
+  )
+  column_names <- stable_mz_column_names(mz_values)
+  if (anyDuplicated(column_names)) {
+    stop("Stable m/z column names are not unique.", call. = FALSE)
+  }
+  colnames(oriented$values) <- column_names
+
+  pixel_matrix <- data.frame(
+    pixel_id = seq_len(nrow(coordinates)),
+    sample_id = rep(sample_id, nrow(coordinates)),
+    section_id = rep(section_id, nrow(coordinates)),
+    x = coordinates$x,
+    y = coordinates$y,
+    oriented$values,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+  feature_metadata <- data.frame(
+    feature_id = sprintf("feature_%04d", seq_along(mz_values)),
+    column_name = column_names,
+    mz = mz_values,
+    ion_mode = rep(ion_mode, length(mz_values)),
+    stringsAsFactors = FALSE
+  )
+  coordinate_table <- pixel_matrix[, c("pixel_id", "sample_id", "section_id", "x", "y"), drop = FALSE]
+  qc_summary <- list(
+    spectra_count = nrow(coordinates),
+    feature_count = length(mz_values),
+    spectrum_type = spectrum_type,
+    spectrum_representation = "centroided",
+    shared_mz_axis = TRUE,
+    intensity_source_orientation = oriented$source_orientation,
+    intensity_output_orientation = "spectra_x_features",
+    duplicate_coordinates = 0L,
+    missing_coordinates = 0L
+  )
+  parameters <- list(
+    input_type = "centroided_imzML_shared_mz",
+    sample_id = sample_id,
+    section_id = section_id,
+    ion_mode = ion_mode,
+    ion_mode_source = ion_mode_source,
+    polarity_confirmed_by_imzml_cv = FALSE
+  )
+  provenance <- make_pipeline_manifest(
+    input_files = c(imzml_path, ibd_path),
+    input_type = parameters$input_type,
+    ion_mode = ion_mode,
+    parameters = parameters
+  )
+  provenance <- rbind(
+    provenance,
+    data.frame(
+      record_type = "polarity_statement",
+      key = c("polarity_interpretation_source", "polarity_cv_metadata_status"),
+      value = c(ion_mode_source, "not_confirmed"),
+      size_bytes = NA_real_,
+      md5 = NA_character_,
+      stringsAsFactors = FALSE
+    )
+  )
+
+  list(
+    pixel_feature_matrix = pixel_matrix,
+    coordinates = coordinate_table,
+    feature_metadata = feature_metadata,
+    qc_summary = qc_summary,
+    parameters = parameters,
+    provenance = provenance
+  )
+}
+
+prepare_lipid_annotation_mapping <- function(annotation_path,
+                                             feature_metadata,
+                                             ppm) {
+  if (!file.exists(annotation_path)) {
+    stop("Annotation file does not exist: ", annotation_path, call. = FALSE)
+  }
+  required_columns(feature_metadata, c("feature_id", "column_name", "mz"), "Feature metadata")
+  if (length(ppm) != 1L || !is.finite(ppm) || ppm <= 0) {
+    stop("ppm must be one positive finite value.", call. = FALSE)
+  }
+  annotation <- utils::read.delim(
+    annotation_path,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+  annotation_columns <- c("Input Mass", "Matched Mass", "Delta", "Name", "Formula", "Ion", "LMSD Examples")
+  required_columns(annotation, annotation_columns, "Lipid annotation table")
+  annotation <- annotation[, annotation_columns, drop = FALSE]
+  annotation[["Input Mass"]] <- suppressWarnings(as.numeric(annotation[["Input Mass"]]))
+  if (any(!is.finite(annotation[["Input Mass"]]))) {
+    stop("Input Mass must contain only finite numeric values.", call. = FALSE)
+  }
+  feature_mz <- suppressWarnings(as.numeric(feature_metadata$mz))
+  if (any(!is.finite(feature_mz))) {
+    stop("Feature metadata m/z values must be finite numeric values.", call. = FALSE)
+  }
+
+  nearest <- vapply(annotation[["Input Mass"]], function(query_mz) {
+    which.min(abs(feature_mz - query_mz))
+  }, integer(1))
+  signed_ppm_error <- (feature_mz[nearest] - annotation[["Input Mass"]]) /
+    annotation[["Input Mass"]] * 1e6
+  matched <- abs(signed_ppm_error) <= ppm + (.Machine$double.eps * 1e6)
+  annotation$msi_feature_id <- ifelse(matched, feature_metadata$feature_id[nearest], NA_character_)
+  annotation$msi_column_name <- ifelse(matched, feature_metadata$column_name[nearest], NA_character_)
+  annotation$msi_mz <- ifelse(matched, feature_mz[nearest], NA_real_)
+  annotation$ppm_error <- ifelse(matched, abs(signed_ppm_error), NA_real_)
+  annotation$match_status <- ifelse(matched, "matched", "unmatched")
+  annotation$annotation_evidence <- "putative_accurate_mass_annotation"
+  annotation
+}
+
+map_spatial_domain_labels <- function(pixel_matrix,
+                                      umap_path,
+                                      sample_id,
+                                      sample_column = "sample",
+                                      label_column = "label") {
+  required_columns(pixel_matrix, c("sample_id", "x", "y"), "Pixel matrix")
+  if (!file.exists(umap_path)) {
+    stop("UMAP/domain file does not exist: ", umap_path, call. = FALSE)
+  }
+  if (length(sample_id) != 1L || is.na(sample_id) || !nzchar(sample_id)) {
+    stop("sample_id must be supplied explicitly.", call. = FALSE)
+  }
+  domains <- utils::read.csv(umap_path, check.names = FALSE, stringsAsFactors = FALSE)
+  required_columns(domains, c(sample_column, "x", "y", label_column), "UMAP/domain table")
+  domains <- domains[as.character(domains[[sample_column]]) == as.character(sample_id), , drop = FALSE]
+  if (nrow(domains) == 0L) {
+    stop("No domain rows were found for sample_id '", sample_id, "'.", call. = FALSE)
+  }
+  domain_keys <- paste(domains[[sample_column]], domains$x, domains$y, sep = "\r")
+  if (anyDuplicated(domain_keys)) {
+    stop("Domain labels are not one-to-one by sample + x + y.", call. = FALSE)
+  }
+  pixel_keys <- paste(pixel_matrix$sample_id, pixel_matrix$x, pixel_matrix$y, sep = "\r")
+  if (anyDuplicated(pixel_keys)) {
+    stop("Pixel coordinates are not one-to-one by sample + x + y.", call. = FALSE)
+  }
+  if (length(pixel_keys) != length(domain_keys) || !setequal(pixel_keys, domain_keys)) {
+    stop(
+      "Pixel and domain coordinates must match one-to-one for the requested sample.",
+      call. = FALSE
+    )
+  }
+  match_index <- match(pixel_keys, domain_keys)
+  raw_label <- as.character(domains[[label_column]][match_index])
+  allowed <- c("-1", "0", "1", "2")
+  if (any(!raw_label %in% allowed)) {
+    stop("Domain labels must be one of -1, 0, 1, or 2.", call. = FALSE)
+  }
+  out <- pixel_matrix
+  out$domain_id <- raw_label
+  out$domain_label <- ifelse(
+    raw_label == "-1",
+    "unclassified/background",
+    paste0("metabolic_domain_", raw_label)
+  )
+  out$domain_type <- ifelse(
+    raw_label == "-1",
+    "unclassified/background",
+    "data-driven metabolic domain"
+  )
+  out
+}
+
 load_serial_msi_target_features <- function(imzml_paths,
                                             mzmine_features,
                                             ppm = 10,
