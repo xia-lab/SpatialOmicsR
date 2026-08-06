@@ -1,0 +1,195 @@
+---
+title: "Spatial Metabolomics Workflow"
+author: ""
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Spatial Metabolomics Workflow}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+# Introduction
+
+## Biological question
+
+This vignette outlines a reproducible workflow for analyzing spatial metabolomics data
+to identify spatially variable metabolites and validate putative identifications using
+orthogonal LC-MS/MS data.
+
+## Example dataset (msiFlow mouse bladder)
+
+We use a small example subset from the `ly6g_heterogeneity_signatures.zip` archive
+hosted on Zenodo (https://zenodo.org/records/11913042) as a compact demonstration
+dataset. For extended analysis, the full `region_group_analysis.zip` in the same
+record can be used. Do not attempt to download the full ~3.1 GB archive in this
+demo — the vignette provides instructions and code to retrieve and prepare data
+but those chunks are marked `eval=FALSE`.
+
+## Data provenance and LC-MS/MS accession
+
+- MSI and histology image files: see `ly6g_heterogeneity_signatures.zip` on Zenodo (Zenodo record: 11913042). For a formal DOI pointing to related MSI/IFM resources, see https://doi.org/10.5281/zenodo.14184882.
+- Extended region-level data: `region_group_analysis.zip` (available via the Zenodo record linked above) — this archive provides the larger dataset used for extended analyses; it is not the sole formal accession for all source data.
+- LC-MS/MS dataset accession: MSV000096465. LC-MS/MS is referenced here as an orthogonal method for validating putative metabolite identities (matching by m/z, ppm and ion mode). We do not claim LC-MS/MS represents matched quantitative biological replicates for the MSI samples.
+
+# Data Processing
+
+The processing stage is split into five explicit steps. Each step documents the
+expected input, example function calls (from this package), outputs, and QC/failure checks.
+
+## Step 1: Input validation and MSI import
+
+- Input: a peak-picked MSI CSV with pixel coordinates and `mz_` feature columns.
+- Function calls:
+
+```{r eval=FALSE}
+# import from CSV
+pixel_matrix <- import_peakpicked_msi_csv("path/to/peakpicked.csv")
+required_columns(pixel_matrix, c("x", "y"), "MSI pixel matrix")
+fcols <- feature_columns(pixel_matrix)
+```
+
+- Output: a `data.frame` with pixel metadata and numeric feature columns.
+- QC/Failures: check for finite coordinates, at least a small number of features,
+  and existence of declared columns.
+
+## Step 2: Pixel/feature QC
+
+- Input: `pixel_matrix` from Step 1.
+- Function calls:
+
+```{r eval=FALSE}
+# filter bad pixels and low-information features
+keep <- rowSums(as.matrix(pixel_matrix[fcols]) > 0, na.rm = TRUE) >= 1
+filtered <- pixel_matrix[keep, , drop = FALSE]
+# construct QC summary
+qc_summary <- list(raw_pixels = nrow(pixel_matrix), retained_pixels = nrow(filtered))
+```
+
+- Output: filtered pixel matrix and `qc_summary` list.
+- QC/Failures: ensure `retained_pixels > 0`; otherwise stop with informative message.
+
+## Step 3: TIC normalization, log transformation and scaling
+
+- Input: filtered pixel-feature matrix.
+- Function calls:
+
+```{r eval=FALSE}
+normalized <- sweep(as.matrix(filtered[fcols]), 1, rowSums(filtered[fcols], na.rm=TRUE), "/")
+normalized <- log10(normalized + 1)
+normalized <- scale(normalized)
+```
+
+- Output: numeric matrix `normalized` ready for spatial analysis.
+- QC/Failures: check for non-finite values after transforms and handle zeros/NA.
+
+## Step 4: H&E/IF image registration and ROI definition
+
+- Input: histology control points, MSI coordinates and ROI definitions.
+- Function calls: (illustrative; heavy image processing steps disabled here)
+
+```{r eval=FALSE}
+# register histology coordinates to MSI coordinates
+reg <- fit_histology_msi_registration(control_points)
+coords <- transform_histology_coordinates(histology_coordinates, reg)
+# define ROIs from clusters or coordinate ROI table
+roi_matrix <- define_rois(normalized, mode = "coordinate", roi_table = roi_table)
+```
+
+- Output: spatial transforms, transformed coordinate table, and ROI labels mapped to pixels.
+- QC/Failures: verify ROI overlap with pixel coverage; warn if ROIs contain few pixels.
+
+## Step 5: Subregion aggregation and standardized output
+
+- Input: normalized feature matrix and ROI definitions.
+- Function calls:
+
+```{r eval=FALSE}
+clustered <- cluster_pixels(normalized, k = 3, pca_components = 10)
+roi_matrix <- define_rois(clustered$matrix, mode = "cluster")
+sampled <- sample_subregions(
+  roi_matrix,
+  grid_size = 5,
+  min_pixels = 30
+)
+metabo_data <- make_metaboanalyst_data(sampled$sample_matrix)
+write.csv(sampled$sample_matrix, "region_summary.csv", row.names = FALSE)
+```
+
+- Output: aggregated region-level summaries and a standardized sample matrix ready for downstream analysis.
+- QC/Failures: check that aggregation did not produce empty regions; validate column names.
+
+# Data Analysis
+
+This section describes common analysis tasks performed after processing.
+
+## Task 1: Spatially variable metabolites using Moran's I
+
+- Input: pixel-feature matrix and coordinates.
+- Function calls:
+
+```{r eval=FALSE}
+spatial <- compute_spatially_variable_metabolites(pixel_feature_matrix, coordinates)
+```
+
+- Output: a table of features with Moran's I and permutation p-values.
+- QC/Failures: ensure permutation counts > 0; check p-value finite.
+
+## Task 2: Spatial domains and ROI profiles
+
+- Input: normalized matrix and optional image-derived features.
+- Function calls:
+
+```{r eval=FALSE}
+clustered <- cluster_pixels(normalized, k = 3, pca_components = 10)
+# sample_subregions can be used to summarize ROI profiles by spatial subregions
+sampled <- sample_subregions(clustered$matrix, grid_size = 5, min_pixels = 30)
+profiles <- sampled$sample_matrix
+```
+
+- Output: domain segmentation map and per-region sample profiles.
+
+## Task 3: Differential analysis between tissue regions
+
+- Input: region-aggregated sample matrix and group labels.
+- Function calls:
+
+```{r eval=FALSE}
+metabo_data <- make_metaboanalyst_data(sampled$sample_matrix)
+# export metabo_data to MetaboAnalyst or other differential analysis tools
+# result <- run_differential_analysis_in_metaboanalyst(metabo_data)
+# normalized <- normalize_metaboanalyst_result(result, source_name = "metaboanalyst")
+```
+
+- Output: a prepared data frame for differential analysis and normalized result import support.
+
+## Task 4: MSI–LC-MS/MS cross-validation using m/z, ppm and ion mode
+
+- Input: MSI feature table and LC-MS/MS identifications.
+- Function calls:
+
+```{r eval=FALSE}
+matched <- cross_validate_msi_lcms(msi_features, lcms_features, ppm = 10)
+```
+
+- Output: matched table with ppm error and direction agreement.
+- QC/Failures: apply numeric tolerance when comparing ppm boundaries; inspect unmatched features.
+
+# Data downloads and example dataset
+
+Quick example (small): download and extract `ly6g_heterogeneity_signatures.zip` from
+Zenodo (https://zenodo.org/records/11913042). For extended analyses, obtain the
+`region_group_analysis.zip` archive from the same record (large, ~3.1 GB) and
+follow the package's `inst/` or `data/` ingestion functions to prepare data.
+
+LC-MS/MS dataset accession used as example: MSV000096465
+
+---
+
+Session info and package citation (render-time):
+
+```{r session, eval=FALSE}
+sessionInfo()
+citation("SpatialOmicsMSI")
+```
+
+<!-- end vignette -->

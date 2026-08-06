@@ -1,0 +1,5 @@
+^\.lib(?:/|$)
+^data_raw(?:/|$)
+^data_processed(?:/|$)
+^results(?:/|$)
+^figures(?:/|$)

@@ -27,4 +27,7 @@ Suggests:
     DT,
     tidyr,
     tidyselect,
-    zip
+    zip,
+    knitr,
+    rmarkdown
+VignetteBuilder: knitr
