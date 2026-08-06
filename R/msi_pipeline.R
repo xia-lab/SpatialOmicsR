@@ -2110,6 +2110,180 @@ make_metaboanalyst_data <- function(sample_matrix,
   )
 }
 
+differential_region_analysis <- function(sample_matrix,
+                                         group_column = "roi_id",
+                                         subject_column = NULL,
+                                         section_column = NULL,
+                                         reference_group = NULL,
+                                         p_adjust_method = "BH") {
+  required_columns(sample_matrix, c("sample_id", group_column), "Sample matrix")
+  fcols <- feature_columns(sample_matrix)
+  if (length(fcols) == 0) {
+    stop("No mz_ feature columns found in sample_matrix.", call. = FALSE)
+  }
+
+  optional_columns <- c(subject_column, section_column)
+  optional_columns <- optional_columns[!is.na(optional_columns) & nzchar(optional_columns)]
+  required_columns(sample_matrix, optional_columns, "Sample matrix")
+  groups <- unique(as.character(sample_matrix[[group_column]]))
+  groups <- groups[!is.na(groups) & nzchar(groups)]
+  if (length(groups) < 2L) {
+    stop("At least two non-empty regions are required for differential analysis.", call. = FALSE)
+  }
+
+  if (!is.null(reference_group)) {
+    reference_group <- as.character(reference_group)[1]
+    if (!reference_group %in% groups) {
+      stop("reference_group is not present in ", group_column, ".", call. = FALSE)
+    }
+    comparison_groups <- setdiff(groups, reference_group)
+    comparisons <- rbind(rep(reference_group, length(comparison_groups)), comparison_groups)
+  } else {
+    comparisons <- utils::combn(groups, 2L)
+  }
+
+  if (!is.null(subject_column)) {
+    replicate_column <- subject_column
+    inference_unit <- "biological_subject"
+    pseudoreplication_warning <- FALSE
+  } else if (!is.null(section_column)) {
+    replicate_column <- section_column
+    inference_unit <- "section"
+    pseudoreplication_warning <- TRUE
+    warning(
+      "No biological subject column was supplied. Tiles are aggregated within section and ",
+      "section-level results must not be described as independent biological replication.",
+      call. = FALSE
+    )
+  } else {
+    replicate_column <- "sample_id"
+    inference_unit <- "sample_or_tile"
+    pseudoreplication_warning <- TRUE
+    warning(
+      "No biological subject or section column was supplied. P-values treat sample rows as ",
+      "independent and may be pseudoreplicated; use results as exploratory only.",
+      call. = FALSE
+    )
+  }
+
+  work_columns <- unique(c(group_column, replicate_column, section_column, fcols))
+  work <- sample_matrix[, work_columns, drop = FALSE]
+  work[[group_column]] <- as.character(work[[group_column]])
+  work[[replicate_column]] <- as.character(work[[replicate_column]])
+  work <- work[
+    !is.na(work[[group_column]]) & nzchar(work[[group_column]]) &
+      !is.na(work[[replicate_column]]) & nzchar(work[[replicate_column]]),
+    ,
+    drop = FALSE
+  ]
+  if (nrow(work) == 0L) {
+    stop("No rows remain after removing missing group or replicate identifiers.", call. = FALSE)
+  }
+
+  aggregate_data <- work
+  aggregate_data$.__group__ <- aggregate_data[[group_column]]
+  aggregate_data$.__replicate__ <- aggregate_data[[replicate_column]]
+  aggregated <- stats::aggregate(
+    aggregate_data[, fcols, drop = FALSE],
+    by = list(
+      .__group__ = aggregate_data$.__group__,
+      .__replicate__ = aggregate_data$.__replicate__
+    ),
+    FUN = function(x) mean(as.numeric(x), na.rm = TRUE)
+  )
+
+  standardized_effect <- function(left, right) {
+    n_left <- sum(is.finite(left))
+    n_right <- sum(is.finite(right))
+    if (n_left < 2L || n_right < 2L) return(NA_real_)
+    pooled_df <- n_left + n_right - 2
+    pooled_sd <- sqrt(((n_left - 1) * stats::var(left) + (n_right - 1) * stats::var(right)) / pooled_df)
+    if (!is.finite(pooled_sd) || pooled_sd == 0) return(NA_real_)
+    d <- (mean(right) - mean(left)) / pooled_sd
+    correction <- if (pooled_df > 1) 1 - 3 / (4 * pooled_df - 1) else NA_real_
+    d * correction
+  }
+
+  rows <- list()
+  row_index <- 1L
+  for (comparison_index in seq_len(ncol(comparisons))) {
+    group_a <- comparisons[1, comparison_index]
+    group_b <- comparisons[2, comparison_index]
+    left_rows <- aggregated$.__group__ == group_a
+    right_rows <- aggregated$.__group__ == group_b
+    for (feature in fcols) {
+      left <- as.numeric(aggregated[[feature]][left_rows])
+      right <- as.numeric(aggregated[[feature]][right_rows])
+      names(left) <- aggregated$.__replicate__[left_rows]
+      names(right) <- aggregated$.__replicate__[right_rows]
+      left <- left[is.finite(left)]
+      right <- right[is.finite(right)]
+      shared_replicates <- intersect(names(left), names(right))
+      paired <- inference_unit != "sample_or_tile" && length(shared_replicates) >= 2L
+      p_value <- NA_real_
+      if (paired) {
+        left_test <- left[shared_replicates]
+        right_test <- right[shared_replicates]
+      } else {
+        left_test <- left
+        right_test <- right
+      }
+      if (length(left_test) >= 2L && length(right_test) >= 2L) {
+        if (paired && stats::sd(right_test - left_test) == 0) {
+          p_value <- if (mean(right_test - left_test) == 0) 1 else 0
+        } else if (!paired && stats::sd(left_test) == 0 && stats::sd(right_test) == 0) {
+          p_value <- if (mean(right_test) == mean(left_test)) 1 else 0
+        } else {
+          p_value <- tryCatch(
+            stats::t.test(right_test, left_test, paired = paired)$p.value,
+            error = function(e) NA_real_
+          )
+        }
+      }
+      paired_effect <- if (paired) {
+        differences <- right_test - left_test
+        difference_sd <- stats::sd(differences)
+        if (is.finite(difference_sd) && difference_sd > 0) mean(differences) / difference_sd else NA_real_
+      } else {
+        standardized_effect(left_test, right_test)
+      }
+      rows[[row_index]] <- data.frame(
+        feature = feature,
+        mz = suppressWarnings(as.numeric(sub("^mz_", "", feature))),
+        group_a = group_a,
+        group_b = group_b,
+        mean_group_a = if (length(left)) mean(left) else NA_real_,
+        mean_group_b = if (length(right)) mean(right) else NA_real_,
+        effect_size = if (length(left) && length(right)) mean(right) - mean(left) else NA_real_,
+        standardized_effect = paired_effect,
+        p_value = p_value,
+        n_group_a = length(left),
+        n_group_b = length(right),
+        n_pairs = if (paired) length(shared_replicates) else NA_integer_,
+        test_type = if (paired) "paired_t_test" else "welch_t_test",
+        inference_unit = inference_unit,
+        subject_column = if (is.null(subject_column)) NA_character_ else subject_column,
+        section_column = if (is.null(section_column)) NA_character_ else section_column,
+        pseudoreplication_warning = pseudoreplication_warning,
+        stringsAsFactors = FALSE
+      )
+      row_index <- row_index + 1L
+    }
+  }
+  result <- do.call(rbind, rows)
+  result$fdr <- stats::ave(
+    result$p_value,
+    interaction(result$group_a, result$group_b, drop = TRUE),
+    FUN = function(x) stats::p.adjust(x, method = p_adjust_method)
+  )
+  result <- result[, c(
+    "feature", "mz", "group_a", "group_b", "mean_group_a", "mean_group_b",
+    "effect_size", "standardized_effect", "p_value", "fdr", "n_group_a", "n_group_b", "n_pairs", "test_type",
+    "inference_unit", "subject_column", "section_column", "pseudoreplication_warning"
+  )]
+  result[order(result$fdr, -abs(result$effect_size), na.last = TRUE), , drop = FALSE]
+}
+
 detect_metaboanalyst_result <- function(result_data) {
   columns <- names(result_data)
   if (all(c("Feature", "VIP") %in% columns)) return("vip")
@@ -2498,7 +2672,7 @@ compute_spatially_variable_metabolites <- function(pixel_matrix,
     required_columns(pixel_matrix, "pixel_id", "Pixel matrix")
     required_columns(coordinates, c("pixel_id", x_col, y_col), "Coordinates")
     coords <- merge(
-      pixel_matrix["pixel_id", drop = FALSE],
+      pixel_matrix[, "pixel_id", drop = FALSE],
       coordinates[, c("pixel_id", x_col, y_col), drop = FALSE],
       by = "pixel_id",
       sort = FALSE
@@ -2607,14 +2781,9 @@ cross_validate_msi_lcms <- function(msi_features,
       direction_agreement <- sign(msi_log2fc) == sign(lcms_log2fc)
     }
 
-    msi_id <- if ("feature_id" %in% names(msi_features)) as.character(msi_features$feature_id[i]) else NA_character_
     lcms_id <- if (!is.null(lcms_id_col)) as.character(lcms_features[[lcms_id_col]][chosen]) else NA_character_
     lcms_name <- if (!is.null(lcms_name_col)) as.character(lcms_features[[lcms_name_col]][chosen]) else NA_character_
-    match_type <- if (!is.na(msi_id) && !is.na(lcms_id) && nzchar(msi_id) && nzchar(lcms_id) && identical(msi_id, lcms_id)) {
-      "confirmed"
-    } else {
-      "putative"
-    }
+    match_type <- "feature_level_orthogonal_support"
     lcms_rt <- if (!is.null(lcms_rt_col)) lcms_features[[lcms_rt_col]][chosen] else NA_real_
 
     rows[[length(rows) + 1L]] <- data.frame(
@@ -2655,9 +2824,8 @@ cross_validate_msi_lcms <- function(msi_features,
   summary <- data.frame(
     total_msi_features = nrow(msi_features),
     matched_features = nrow(result),
-    confirmed_matches = sum(result$match_type == "confirmed", na.rm = TRUE),
-    putative_matches = sum(result$match_type == "putative", na.rm = TRUE),
-    agreement_rate = if (nrow(result) == 0) NA_real_ else sum(result$direction_agreement == TRUE, na.rm = TRUE) / sum(!is.na(result$direction_agreement)),
+    feature_level_supported_matches = sum(result$match_type == "feature_level_orthogonal_support", na.rm = TRUE),
+    agreement_rate = if (sum(!is.na(result$direction_agreement)) == 0) NA_real_ else mean(result$direction_agreement, na.rm = TRUE),
     stringsAsFactors = FALSE
   )
   attr(result, "summary") <- summary
@@ -3543,13 +3711,20 @@ write_pipeline_outputs <- function(output_dir,
                                    clustered_matrix = NULL,
                                    sample_matrix = NULL,
                                    sample_mapping = NULL,
-                                   metaboanalyst_data = NULL) {
+                                   metaboanalyst_data = NULL,
+                                   coordinates = NULL,
+                                   feature_metadata = NULL,
+                                   qc_summary = NULL,
+                                   processing_parameters = NULL,
+                                   provenance = NULL) {
   if (!dir.exists(output_dir)) {
     dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
   }
 
   outputs <- list(
     pixel_feature_matrix.csv = pixel_matrix,
+    coordinates.csv = coordinates,
+    feature_metadata.csv = feature_metadata,
     feature_mapping.csv = feature_mapping,
     section_mapping.csv = section_mapping,
     background_stats.csv = background_stats,
@@ -3562,6 +3737,24 @@ write_pipeline_outputs <- function(output_dir,
     metaboanalyst_data.csv = metaboanalyst_data
   )
 
+  flatten_values <- function(x, prefix = "") {
+    if (is.null(x)) return(data.frame(key = character(), value = character(), stringsAsFactors = FALSE))
+    if (is.data.frame(x)) return(x)
+    if (!is.list(x)) {
+      return(data.frame(key = prefix, value = paste(as.character(x), collapse = ";"), stringsAsFactors = FALSE))
+    }
+    rows <- lapply(names(x), function(name) {
+      key <- if (nzchar(prefix)) paste(prefix, name, sep = ".") else name
+      flatten_values(x[[name]], key)
+    })
+    rows <- Filter(function(item) nrow(item) > 0L, rows)
+    if (!length(rows)) data.frame(key = character(), value = character(), stringsAsFactors = FALSE) else do.call(rbind, rows)
+  }
+
+  outputs[["qc_summary.csv"]] <- if (is.null(qc_summary) || is.data.frame(qc_summary)) qc_summary else flatten_values(qc_summary)
+  outputs[["processing_parameters.csv"]] <- if (is.null(processing_parameters) || is.data.frame(processing_parameters)) processing_parameters else flatten_values(processing_parameters)
+  outputs[["provenance_manifest.csv"]] <- if (is.null(provenance) || is.data.frame(provenance)) provenance else flatten_values(provenance)
+
   written <- character()
   for (file_name in names(outputs)) {
     data <- outputs[[file_name]]
@@ -3572,6 +3765,49 @@ write_pipeline_outputs <- function(output_dir,
   }
 
   written
+}
+
+make_pipeline_manifest <- function(input_files,
+                                   input_type,
+                                   ion_mode = NA_character_,
+                                   ppm = NA_real_,
+                                   parameters = list(),
+                                   package_name = "SpatialOmicsMSI") {
+  input_files <- normalizePath(input_files, mustWork = TRUE)
+  info <- file.info(input_files)
+  package_version <- tryCatch(
+    as.character(utils::packageVersion(package_name)),
+    error = function(e) NA_character_
+  )
+  manifest <- data.frame(
+    record_type = "input_file",
+    key = basename(input_files),
+    value = input_files,
+    size_bytes = as.numeric(info$size),
+    md5 = unname(tools::md5sum(input_files)),
+    stringsAsFactors = FALSE
+  )
+  metadata <- data.frame(
+    record_type = "run_metadata",
+    key = c("input_type", "ion_mode", "ppm", "R_version", "package_version"),
+    value = c(input_type, ion_mode, as.character(ppm), R.version.string, package_version),
+    size_bytes = NA_real_,
+    md5 = NA_character_,
+    stringsAsFactors = FALSE
+  )
+  parameter_rows <- if (length(parameters)) {
+    data.frame(
+      record_type = "processing_parameter",
+      key = names(parameters),
+      value = vapply(parameters, function(x) paste(as.character(x), collapse = ";"), character(1)),
+      size_bytes = NA_real_,
+      md5 = NA_character_,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    manifest[FALSE, ]
+  }
+  rbind(manifest, metadata, parameter_rows)
 }
 
 write_validation_plots <- function(output_dir,

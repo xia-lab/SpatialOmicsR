@@ -1,6 +1,12 @@
 orig_wd <- getwd()
-lib_path <- normalizePath(file.path(orig_wd, ".lib"), mustWork = FALSE)
-if (!dir.exists(lib_path)) stop("Local .lib directory not found: ", lib_path, call. = FALSE)
+checking_installed_package <- nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))
+if (checking_installed_package) {
+  library(SpatialOmicsMSI)
+} else {
+  lib_path <- normalizePath(file.path(orig_wd, ".lib"), mustWork = FALSE)
+  if (!dir.exists(lib_path)) stop("Local .lib directory not found: ", lib_path, call. = FALSE)
+  .libPaths(lib_path)
+}
 
 tmp_dir <- tempfile("pipeline_validation_")
 dir.create(tmp_dir, recursive = TRUE)
@@ -9,9 +15,7 @@ on.exit({
   unlink(tmp_dir, recursive = TRUE, force = TRUE)
 }, add = TRUE)
 setwd(tmp_dir)
-.libPaths(lib_path)
-
-source(file.path(orig_wd, "R", "msi_pipeline.R"))
+if (!checking_installed_package) source(file.path(orig_wd, "R", "msi_pipeline.R"))
 
 # Synthetic MSI sample matrix for pipeline validation
 msi_data <- data.frame(
@@ -57,6 +61,34 @@ stopifnot(identical(grep("^mz_", names(pipeline$pixel_feature_matrix), value = T
 stopifnot(identical(grep("^mz_", names(pipeline$coordinates), value = TRUE), character(0)))
 stopifnot(pipeline$qc_summary$input_feature_count == length(feature_cols))
 stopifnot(pipeline$qc_summary$output_feature_count == length(feature_cols))
+
+# Complete standardized outputs and provenance manifest
+manifest <- make_pipeline_manifest(
+  input_files = input_csv,
+  input_type = "peak_picked_csv",
+  ion_mode = "positive",
+  ppm = 10,
+  parameters = pipeline$parameters
+)
+output_dir <- tempfile("standard_outputs_")
+written_outputs <- write_pipeline_outputs(
+  output_dir = output_dir,
+  pixel_matrix = pipeline$pixel_feature_matrix,
+  coordinates = pipeline$coordinates,
+  feature_metadata = pipeline$feature_metadata,
+  qc_summary = pipeline$qc_summary,
+  processing_parameters = pipeline$parameters,
+  provenance = manifest
+)
+required_output_names <- c(
+  "pixel_feature_matrix.csv", "coordinates.csv", "feature_metadata.csv",
+  "qc_summary.csv", "processing_parameters.csv", "provenance_manifest.csv"
+)
+stopifnot(all(file.exists(file.path(output_dir, required_output_names))))
+stopifnot(all(file.path(output_dir, required_output_names) %in% written_outputs))
+written_manifest <- read.csv(file.path(output_dir, "provenance_manifest.csv"), stringsAsFactors = FALSE)
+stopifnot(any(written_manifest$record_type == "input_file"))
+stopifnot(any(nzchar(written_manifest$md5[written_manifest$record_type == "input_file"])))
 
 # Missing x column should error cleanly
 missing_x <- data.frame(y = 1:4, mz_100 = 1:4, mz_150 = 5:8, mz_200 = 9:12, mz_250 = 13:16, mz_300 = 16:1, stringsAsFactors = FALSE)
@@ -146,6 +178,8 @@ ppm_tol <- sqrt(.Machine$double.eps) * max(1, 10)
 stopifnot(all(matched$ppm_error <= 10 + ppm_tol))
 stopifnot(any(matched$direction_agreement == TRUE))
 stopifnot(any(matched$direction_agreement == FALSE) || TRUE)
+stopifnot(all(matched$match_type == "feature_level_orthogonal_support"))
+stopifnot(!"confirmed_matches" %in% names(attr(matched, "summary")))
 
 # One-to-one match selection
 msi_features2 <- data.frame(
@@ -183,6 +217,46 @@ lcms_features_none <- data.frame(
 )
 matched_none <- cross_validate_msi_lcms(msi_features_none, lcms_features_none, ppm = 10)
 stopifnot(nrow(matched_none) == 0)
+
+# Region differential analysis aggregates tiles within biological subject.
+region_samples <- expand.grid(
+  subject_id = paste0("subject_", 1:4),
+  roi_id = c("cortex", "medulla"),
+  tile = 1:2,
+  stringsAsFactors = FALSE
+)
+region_samples$sample_id <- paste(region_samples$subject_id, region_samples$roi_id, region_samples$tile, sep = "_")
+region_samples$section_id <- paste0(region_samples$subject_id, "_section")
+region_samples$mz_100 <- ifelse(region_samples$roi_id == "medulla", 10, 2) + region_samples$tile * 0.1
+region_samples$mz_200 <- rep(c(1, 2), length.out = nrow(region_samples))
+region_diff <- differential_region_analysis(
+  region_samples,
+  group_column = "roi_id",
+  subject_column = "subject_id",
+  section_column = "section_id",
+  reference_group = "cortex"
+)
+stopifnot(all(c("effect_size", "p_value", "fdr", "inference_unit", "subject_column", "section_column") %in% names(region_diff)))
+stopifnot(all(region_diff$n_group_a == 4L))
+stopifnot(all(region_diff$n_group_b == 4L))
+stopifnot(all(region_diff$n_pairs == 4L))
+stopifnot(all(region_diff$test_type == "paired_t_test"))
+stopifnot(region_diff$effect_size[region_diff$feature == "mz_100"] > 0)
+stopifnot(is.finite(region_diff$p_value[region_diff$feature == "mz_100"]))
+stopifnot(all(region_diff$inference_unit == "biological_subject"))
+stopifnot(!any(region_diff$pseudoreplication_warning))
+
+pseudorep_warning <- NULL
+exploratory_diff <- withCallingHandlers(
+  differential_region_analysis(region_samples, group_column = "roi_id", section_column = "section_id"),
+  warning = function(w) {
+    pseudorep_warning <<- conditionMessage(w)
+    invokeRestart("muffleWarning")
+  }
+)
+stopifnot(grepl("must not be described as independent biological replication", pseudorep_warning, fixed = TRUE))
+stopifnot(all(exploratory_diff$pseudoreplication_warning))
+stopifnot(all(exploratory_diff$inference_unit == "section"))
 
 spatial <- compute_spatially_variable_metabolites(
   pipeline$pixel_feature_matrix,
