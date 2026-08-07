@@ -3273,6 +3273,266 @@ cross_validate_msi_lcms <- function(msi_features,
   result
 }
 
+#' Validate explicitly defined diagnostic-ion evidence in MS/MS scans
+#'
+#' This function evaluates user-supplied diagnostic ions without assigning or
+#' inferring chemical identities. A core scan must satisfy both the precursor
+#' tolerance and an isolation window that covers the target precursor.
+#'
+#' @param precursor_scans Data frame containing `scan_number`, `precursor_mz`,
+#'   `isolation_target_mz`, `isolation_lower_offset`,
+#'   `isolation_upper_offset`, and `base_peak_intensity`.
+#' @param fragment_peaks Data frame containing `scan_number`, `fragment_mz`,
+#'   and `fragment_intensity`. Optional provenance columns are retained.
+#' @param diagnostic_ions Data frame with unique `label`, numeric `target_mz`,
+#'   and `evidence_role` columns.
+#' @param precursor_target Numeric target precursor m/z.
+#' @param precursor_ppm_tolerance Non-negative precursor tolerance in ppm.
+#' @param fragment_tolerance Non-negative fragment tolerance.
+#' @param fragment_tolerance_unit Either `"Da"` or `"ppm"`.
+#' @param min_relative_intensity Minimum fragment/base-peak intensity fraction.
+#' @param min_core_scans Minimum number of qualifying core scans for repeated
+#'   support.
+#' @param required_diagnostic_labels Labels that must all achieve repeated
+#'   diagnostic support for the overall rule to pass.
+#' @return A list containing scan-level evidence, diagnostic summaries, and an
+#'   explicit overall support result.
+validate_msms_fragment_evidence <- function(
+    precursor_scans,
+    fragment_peaks,
+    diagnostic_ions,
+    precursor_target,
+    precursor_ppm_tolerance = 10,
+    fragment_tolerance = 0.02,
+    fragment_tolerance_unit = c("Da", "ppm"),
+    min_relative_intensity = 0.01,
+    min_core_scans = 2L,
+    required_diagnostic_labels) {
+  fragment_tolerance_unit <- match.arg(fragment_tolerance_unit)
+  if (!is.data.frame(precursor_scans) || !is.data.frame(fragment_peaks) ||
+      !is.data.frame(diagnostic_ions)) {
+    stop("Precursor scans, fragment peaks, and diagnostic ions must be data frames.", call. = FALSE)
+  }
+  scan_required <- c(
+    "scan_number", "precursor_mz", "isolation_target_mz",
+    "isolation_lower_offset", "isolation_upper_offset", "base_peak_intensity"
+  )
+  peak_required <- c("scan_number", "fragment_mz", "fragment_intensity")
+  diagnostic_required <- c("label", "target_mz", "evidence_role")
+  required_columns(precursor_scans, scan_required, "precursor scan metadata")
+  required_columns(fragment_peaks, peak_required, "fragment peak table")
+  required_columns(diagnostic_ions, diagnostic_required, "diagnostic ion definitions")
+
+  scalar_nonnegative <- function(value, name, positive = FALSE) {
+    value <- suppressWarnings(as.numeric(value))
+    valid <- length(value) == 1L && is.finite(value) &&
+      if (positive) value > 0 else value >= 0
+    if (!valid) stop(name, if (positive) " must be a positive finite number." else " must be a non-negative finite number.", call. = FALSE)
+    value
+  }
+  precursor_target <- scalar_nonnegative(precursor_target, "precursor_target", positive = TRUE)
+  precursor_ppm_tolerance <- scalar_nonnegative(precursor_ppm_tolerance, "precursor_ppm_tolerance")
+  fragment_tolerance <- scalar_nonnegative(fragment_tolerance, "fragment_tolerance")
+  min_relative_intensity <- scalar_nonnegative(min_relative_intensity, "min_relative_intensity")
+  min_core_scans <- suppressWarnings(as.integer(min_core_scans))
+  if (length(min_core_scans) != 1L || is.na(min_core_scans) || min_core_scans < 2L) {
+    stop("min_core_scans must be a single integer of at least 2.", call. = FALSE)
+  }
+  required_diagnostic_labels <- as.character(required_diagnostic_labels)
+  if (length(required_diagnostic_labels) == 0L || anyNA(required_diagnostic_labels) ||
+      any(!nzchar(required_diagnostic_labels))) {
+    stop("required_diagnostic_labels must explicitly name at least one diagnostic label.", call. = FALSE)
+  }
+
+  diagnostic_ions$label <- as.character(diagnostic_ions$label)
+  diagnostic_ions$evidence_role <- as.character(diagnostic_ions$evidence_role)
+  diagnostic_ions$target_mz <- suppressWarnings(as.numeric(diagnostic_ions$target_mz))
+  if (anyNA(diagnostic_ions$label) || any(!nzchar(diagnostic_ions$label)) ||
+      anyDuplicated(diagnostic_ions$label)) {
+    stop("Diagnostic ion labels must be non-missing, non-empty, and unique.", call. = FALSE)
+  }
+  if (anyNA(diagnostic_ions$evidence_role) || any(!nzchar(diagnostic_ions$evidence_role))) {
+    stop("Each diagnostic ion must have an explicit evidence_role.", call. = FALSE)
+  }
+  if (any(!is.finite(diagnostic_ions$target_mz) | diagnostic_ions$target_mz <= 0)) {
+    stop("Diagnostic target m/z values must be positive and finite.", call. = FALSE)
+  }
+  missing_required <- setdiff(required_diagnostic_labels, diagnostic_ions$label)
+  if (length(missing_required) > 0L) {
+    stop("Required diagnostic labels are absent from diagnostic_ions: ",
+         paste(missing_required, collapse = ", "), call. = FALSE)
+  }
+
+  numeric_scan_columns <- setdiff(scan_required, "scan_number")
+  for (column in numeric_scan_columns) {
+    precursor_scans[[column]] <- suppressWarnings(as.numeric(precursor_scans[[column]]))
+  }
+  if (anyDuplicated(as.character(precursor_scans$scan_number))) {
+    stop("precursor_scans must contain one row per scan_number.", call. = FALSE)
+  }
+  if (any(!is.finite(as.matrix(precursor_scans[numeric_scan_columns])))) {
+    stop("Required precursor scan metadata must be numeric and finite.", call. = FALSE)
+  }
+  if (any(precursor_scans$isolation_lower_offset < 0 |
+          precursor_scans$isolation_upper_offset < 0)) {
+    stop("Isolation window offsets must be non-negative.", call. = FALSE)
+  }
+  if (any(precursor_scans$base_peak_intensity <= 0)) {
+    stop("base_peak_intensity must be positive.", call. = FALSE)
+  }
+
+  fragment_peaks$fragment_mz <- suppressWarnings(as.numeric(fragment_peaks$fragment_mz))
+  fragment_peaks$fragment_intensity <- suppressWarnings(as.numeric(fragment_peaks$fragment_intensity))
+  if (any(!is.finite(fragment_peaks$fragment_mz) | fragment_peaks$fragment_mz <= 0) ||
+      any(!is.finite(fragment_peaks$fragment_intensity) | fragment_peaks$fragment_intensity < 0)) {
+    stop("Fragment m/z and intensity values must be finite; m/z must be positive and intensity non-negative.", call. = FALSE)
+  }
+  unknown_scans <- setdiff(as.character(fragment_peaks$scan_number), as.character(precursor_scans$scan_number))
+  if (length(unknown_scans) > 0L) {
+    stop("Fragment peaks reference scan_number values absent from precursor_scans.", call. = FALSE)
+  }
+
+  provenance_columns <- c("peak_source", "extraction_method", "extraction_parameters", "software_version")
+  for (column in provenance_columns) {
+    if (!column %in% names(fragment_peaks)) fragment_peaks[[column]] <- NA_character_
+    fragment_peaks[[column]] <- as.character(fragment_peaks[[column]])
+  }
+  profile_rows <- !is.na(fragment_peaks$peak_source) &
+    grepl("profile", fragment_peaks$peak_source, ignore.case = TRUE)
+  if (any(profile_rows)) {
+    incomplete <- vapply(provenance_columns[-1L], function(column) {
+      any(is.na(fragment_peaks[[column]][profile_rows]) | !nzchar(fragment_peaks[[column]][profile_rows]))
+    }, logical(1))
+    if (any(incomplete)) {
+      stop("Profile-derived peaks require extraction_method, extraction_parameters, and software_version.", call. = FALSE)
+    }
+  }
+
+  precursor_scans$precursor_ppm_error <-
+    (precursor_scans$precursor_mz - precursor_target) / precursor_target * 1e6
+  precursor_scans$selected_precursor_within_tolerance <-
+    abs(precursor_scans$precursor_ppm_error) <= precursor_ppm_tolerance + .Machine$double.eps * 1e6
+  precursor_scans$isolation_window_covers_target <-
+    precursor_target >= precursor_scans$isolation_target_mz - precursor_scans$isolation_lower_offset &
+    precursor_target <= precursor_scans$isolation_target_mz + precursor_scans$isolation_upper_offset
+  precursor_scans$core_scan <- precursor_scans$selected_precursor_within_tolerance &
+    precursor_scans$isolation_window_covers_target
+
+  scan_order <- order(as.character(precursor_scans$scan_number))
+  diagnostic_order <- order(diagnostic_ions$label)
+  precursor_scans <- precursor_scans[scan_order, , drop = FALSE]
+  diagnostic_ions <- diagnostic_ions[diagnostic_order, , drop = FALSE]
+  fragment_peaks <- fragment_peaks[order(as.character(fragment_peaks$scan_number), fragment_peaks$fragment_mz), , drop = FALSE]
+
+  evidence_rows <- vector("list", nrow(precursor_scans) * nrow(diagnostic_ions))
+  row_index <- 1L
+  for (scan_index in seq_len(nrow(precursor_scans))) {
+    scan <- precursor_scans[scan_index, , drop = FALSE]
+    peaks <- fragment_peaks[as.character(fragment_peaks$scan_number) == as.character(scan$scan_number), , drop = FALSE]
+    for (diagnostic_index in seq_len(nrow(diagnostic_ions))) {
+      diagnostic <- diagnostic_ions[diagnostic_index, , drop = FALSE]
+      if (fragment_tolerance_unit == "Da") {
+        errors <- peaks$fragment_mz - diagnostic$target_mz
+        within <- abs(errors) <= fragment_tolerance + .Machine$double.eps
+      } else {
+        errors <- (peaks$fragment_mz - diagnostic$target_mz) / diagnostic$target_mz * 1e6
+        within <- abs(errors) <= fragment_tolerance + .Machine$double.eps * 1e6
+      }
+      candidates <- peaks[within, , drop = FALSE]
+      if (nrow(candidates) > 0L) {
+        chosen_index <- which.max(candidates$fragment_intensity)
+        chosen <- candidates[chosen_index, , drop = FALSE]
+        observed_mz <- chosen$fragment_mz
+        error_da <- observed_mz - diagnostic$target_mz
+        error_ppm <- error_da / diagnostic$target_mz * 1e6
+        raw_intensity <- chosen$fragment_intensity
+        relative_intensity <- raw_intensity / scan$base_peak_intensity
+        provenance <- chosen[1L, provenance_columns, drop = FALSE]
+        mass_match <- TRUE
+      } else {
+        observed_mz <- error_da <- error_ppm <- raw_intensity <- relative_intensity <- NA_real_
+        provenance <- as.data.frame(stats::setNames(rep(list(NA_character_), length(provenance_columns)), provenance_columns), stringsAsFactors = FALSE)
+        mass_match <- FALSE
+      }
+      qualifies <- mass_match && isTRUE(scan$core_scan) &&
+        is.finite(relative_intensity) && relative_intensity >= min_relative_intensity
+      evidence_rows[[row_index]] <- data.frame(
+        scan_number = scan$scan_number,
+        diagnostic_label = diagnostic$label,
+        evidence_role = diagnostic$evidence_role,
+        diagnostic_target_mz = diagnostic$target_mz,
+        observed_mz = observed_mz,
+        mass_error_da = error_da,
+        mass_error_ppm = error_ppm,
+        fragment_tolerance = fragment_tolerance,
+        fragment_tolerance_unit = fragment_tolerance_unit,
+        raw_intensity = raw_intensity,
+        base_peak_intensity = scan$base_peak_intensity,
+        relative_base_peak_intensity = relative_intensity,
+        selected_precursor_mz = scan$precursor_mz,
+        precursor_ppm_error = scan$precursor_ppm_error,
+        selected_precursor_within_tolerance = scan$selected_precursor_within_tolerance,
+        isolation_window_covers_target = scan$isolation_window_covers_target,
+        core_scan = scan$core_scan,
+        mass_match = mass_match,
+        meets_relative_intensity = mass_match && is.finite(relative_intensity) && relative_intensity >= min_relative_intensity,
+        qualifies_core_strength_rule = qualifies,
+        peak_source = provenance$peak_source,
+        extraction_method = provenance$extraction_method,
+        extraction_parameters = provenance$extraction_parameters,
+        software_version = provenance$software_version,
+        stringsAsFactors = FALSE
+      )
+      row_index <- row_index + 1L
+    }
+  }
+  scan_evidence <- do.call(rbind, evidence_rows)
+  rownames(scan_evidence) <- NULL
+
+  summary_rows <- lapply(seq_len(nrow(diagnostic_ions)), function(index) {
+    diagnostic <- diagnostic_ions[index, , drop = FALSE]
+    rows <- scan_evidence[scan_evidence$diagnostic_label == diagnostic$label, , drop = FALSE]
+    n_qualifying <- sum(rows$qualifies_core_strength_rule)
+    n_mass_matches <- sum(rows$mass_match)
+    grade <- if (n_qualifying >= min_core_scans) {
+      "repeated_diagnostic_support"
+    } else if (n_qualifying == 1L) {
+      "single_scan_support"
+    } else if (n_mass_matches > 0L) {
+      "trace_match"
+    } else {
+      "not_detected"
+    }
+    data.frame(
+      diagnostic_label = diagnostic$label,
+      evidence_role = diagnostic$evidence_role,
+      diagnostic_target_mz = diagnostic$target_mz,
+      n_mass_matched_scans = n_mass_matches,
+      n_qualifying_core_scans = n_qualifying,
+      evidence_grade = grade,
+      stringsAsFactors = FALSE
+    )
+  })
+  diagnostic_summary <- do.call(rbind, summary_rows)
+  rownames(diagnostic_summary) <- NULL
+  required_grades <- diagnostic_summary$evidence_grade[
+    match(required_diagnostic_labels, diagnostic_summary$diagnostic_label)
+  ]
+  overall <- data.frame(
+    support_label = "fragment_level_orthogonal_support",
+    support = all(required_grades == "repeated_diagnostic_support"),
+    required_diagnostic_labels = paste(required_diagnostic_labels, collapse = ";"),
+    minimum_core_scan_repeats = min_core_scans,
+    stringsAsFactors = FALSE
+  )
+  result <- list(
+    scan_diagnostic_evidence = scan_evidence,
+    diagnostic_summary = diagnostic_summary,
+    overall = overall
+  )
+  result
+}
+
 backmap_sample_scores <- function(score_data, sample_mapping, score_column) {
   required_columns(score_data, c("Sample", score_column), "Score data")
   required_columns(sample_mapping, c("sample_id", "pixel_ids"), "Sample mapping")

@@ -1,195 +1,341 @@
 ---
-title: "Spatial Metabolomics Workflow"
+title: "Reproducible Spatial Metabolomics: msiFlow Mouse Bladder"
 author: ""
 output: rmarkdown::html_vignette
 vignette: >
-  %\VignetteIndexEntry{Spatial Metabolomics Workflow}
+  %\VignetteIndexEntry{Reproducible Spatial Metabolomics: msiFlow Mouse Bladder}
   %\VignetteEngine{knitr::rmarkdown}
   %\VignetteEncoding{UTF-8}
 ---
 
 # Introduction
 
-## Biological question
+This vignette documents the real-data workflow used for the msiFlow mouse-bladder
+dataset associated with Zenodo record
+[14184882](https://doi.org/10.5281/zenodo.14184882) and LC-MS/MS accession
+[MSV000096465](https://massive.ucsd.edu/ProteoSAFe/dataset.jsp?accession=MSV000096465).
+It separates MSI measurement, data-driven spatial characterization, accurate-mass
+annotation, and fragment-level orthogonal support.
 
-This vignette outlines a reproducible workflow for analyzing spatial metabolomics data
-to identify spatially variable metabolites and validate putative identifications using
-orthogonal LC-MS/MS data.
+The MSI example consists of four infected-bladder samples, UPEC_12--UPEC_15.
+The article describes four infected samples from female mice, so the subject-level
+analysis uses `subject_id = sample_id` and `section_id = sample_id`. The exact animal
+identifier is not embedded in the imzML metadata; all subject-level results therefore
+remain exploratory at (n=4). Pixels and tiles are never treated as biological
+replicates.
 
-## Example dataset (msiFlow mouse bladder)
+Important provenance limits are fixed before analysis:
 
-We use a small example subset from the `ly6g_heterogeneity_signatures.zip` archive
-hosted on Zenodo (https://zenodo.org/records/11913042) as a compact demonstration
-dataset. For extended analysis, the full `region_group_analysis.zip` in the same
-record can be used. Do not attempt to download the full ~3.1 GB archive in this
-demo — the vignette provides instructions and code to retrieve and prepare data
-but those chunks are marked `eval=FALSE`.
-
-## Data provenance and LC-MS/MS accession
-
-- MSI and histology image files: see `ly6g_heterogeneity_signatures.zip` on Zenodo (Zenodo record: 11913042). For a formal DOI pointing to related MSI/IFM resources, see https://doi.org/10.5281/zenodo.14184882.
-- Extended region-level data: `region_group_analysis.zip` (available via the Zenodo record linked above) — this archive provides the larger dataset used for extended analyses; it is not the sole formal accession for all source data.
-- LC-MS/MS dataset accession: MSV000096465. LC-MS/MS is referenced here as an orthogonal method for validating putative metabolite identities (matching by m/z, ppm and ion mode). We do not claim LC-MS/MS represents matched quantitative biological replicates for the MSI samples.
+- The supplied imzML files already contain 252 centroided, shared-axis MSI features.
+  Loading them does **not** mean this package performed raw profile peak picking,
+  alignment, or de-isotoping.
+- Positive polarity is passed explicitly with
+  `ion_mode_source = "inferred_from_annotation_adducts"`. It was not established
+  from polarity CV metadata in these imzML files.
+- Domains 0--2 are data-driven metabolic domains derived from the same MSI data.
+  Comparing them is exploratory characterization and has circularity risk.
+- Domain -1 means unclassified/background. It is retained for maps and QC but
+  excluded from formal domain comparisons.
+- This downloaded subset has no H&E image. The source study uses IFM on consecutive
+  sections; this workflow must not be described as H&E validation.
+- LC-MS/MS is a companion orthogonal dataset, not pixel-matched or demonstrably
+  paired to the individual MSI section. Fragment evidence supports compatibility
+  with a paper-reported assignment, not MSI--LC-MS quantitative correlation.
 
 # Data Processing
 
-The processing stage is split into five explicit steps. Each step documents the
-expected input, example function calls (from this package), outputs, and QC/failure checks.
+The reproducible processing contract is strictly:
 
-## Step 1: Input validation and MSI import
-
-- Input: a peak-picked MSI CSV with pixel coordinates and `mz_` feature columns.
-- Function calls:
-
-```{r eval=FALSE}
-# import from CSV
-pixel_matrix <- import_peakpicked_msi_csv("path/to/peakpicked.csv")
-required_columns(pixel_matrix, c("x", "y"), "MSI pixel matrix")
-fcols <- feature_columns(pixel_matrix)
+```text
+Input -> 1. validation/provenance -> 2. imzML feature matrix
+      -> 3. pixel/feature QC -> 4. TIC normalization + log1p
+      -> 5. standardized output + manifest
 ```
 
-- Output: a `data.frame` with pixel metadata and numeric feature columns.
-- QC/Failures: check for finite coordinates, at least a small number of features,
-  and existence of declared columns.
+## Step 1: input validation and provenance
 
-## Step 2: Pixel/feature QC
+For imzML input, supply the `.imzML` path, its same-basename `.ibd`, sample and
+section identifiers, and an explicit ion mode. `annotation.tsv` is not used to
+pre-filter MSI features; it is only used later for one-to-many putative
+accurate-mass annotation.
 
-- Input: `pixel_matrix` from Step 1.
-- Function calls:
+```{r processing-step-1, eval=FALSE}
+library(SpatialOmicsMSI)
 
-```{r eval=FALSE}
-# filter bad pixels and low-information features
-keep <- rowSums(as.matrix(pixel_matrix[fcols]) > 0, na.rm = TRUE) >= 1
-filtered <- pixel_matrix[keep, , drop = FALSE]
-# construct QC summary
-qc_summary <- list(raw_pixels = nrow(pixel_matrix), retained_pixels = nrow(filtered))
-```
+root <- "data_raw/msiflow/ly6g_heterogeneity_signatures"
+imzml <- file.path(root, "msi", "UPEC_12.imzML")
+ibd <- sub("[.]imzML$", ".ibd", imzml)
+stopifnot(file.exists(imzml), file.exists(ibd))
 
-- Output: filtered pixel matrix and `qc_summary` list.
-- QC/Failures: ensure `retained_pixels > 0`; otherwise stop with informative message.
-
-## Step 3: TIC normalization, log transformation and scaling
-
-- Input: filtered pixel-feature matrix.
-- Function calls:
-
-```{r eval=FALSE}
-normalized <- sweep(as.matrix(filtered[fcols]), 1, rowSums(filtered[fcols], na.rm=TRUE), "/")
-normalized <- log10(normalized + 1)
-normalized <- scale(normalized)
-```
-
-- Output: numeric matrix `normalized` ready for spatial analysis.
-- QC/Failures: check for non-finite values after transforms and handle zeros/NA.
-
-## Step 4: H&E/IF image registration and ROI definition
-
-- Input: histology control points, MSI coordinates and ROI definitions.
-- Function calls: (illustrative; heavy image processing steps disabled here)
-
-```{r eval=FALSE}
-# register histology coordinates to MSI coordinates
-reg <- fit_histology_msi_registration(control_points)
-coords <- transform_histology_coordinates(histology_coordinates, reg)
-# define ROIs from clusters or coordinate ROI table
-roi_matrix <- define_rois(normalized, mode = "coordinate", roi_table = roi_table)
-```
-
-- Output: spatial transforms, transformed coordinate table, and ROI labels mapped to pixels.
-- QC/Failures: verify ROI overlap with pixel coverage; warn if ROIs contain few pixels.
-
-## Step 5: Subregion aggregation and standardized output
-
-- Input: normalized feature matrix and ROI definitions.
-- Function calls:
-
-```{r eval=FALSE}
-clustered <- cluster_pixels(normalized, k = 3, pca_components = 10)
-roi_matrix <- define_rois(clustered$matrix, mode = "cluster")
-sampled <- sample_subregions(
-  roi_matrix,
-  grid_size = 5,
-  min_pixels = 30
+input_manifest <- make_pipeline_manifest(
+  input_files = c(imzml, ibd),
+  input_type = "shared_axis_centroided_imzML",
+  ion_mode = "positive",
+  ppm = 10,
+  parameters = list(
+    sample_id = "UPEC_12",
+    section_id = "UPEC_12",
+    ion_mode_source = "inferred_from_annotation_adducts"
+  )
 )
-metabo_data <- make_metaboanalyst_data(sampled$sample_matrix)
-write.csv(sampled$sample_matrix, "region_summary.csv", row.names = FALSE)
 ```
 
-- Output: aggregated region-level summaries and a standardized sample matrix ready for downstream analysis.
-- QC/Failures: check that aggregation did not produce empty regions; validate column names.
+The provenance must state that polarity was not established from imzML CV metadata.
+
+## Step 2: centroided imzML/ibd reading and feature-matrix construction
+
+`load_centroided_msi_features()` verifies the companion `.ibd`, MS1 spectra, a
+shared m/z axis, and intensity-array orientation. It retains full-precision m/z in
+`feature_metadata`; stable unique column names do not replace scientific m/z values.
+
+```{r processing-step-2, eval=FALSE}
+upec12 <- load_centroided_msi_features(
+  imzml_path = imzml,
+  sample_id = "UPEC_12",
+  section_id = "UPEC_12",
+  ion_mode = "positive",
+  ion_mode_source = "inferred_from_annotation_adducts"
+)
+
+pixel_feature_matrix <- upec12$pixel_feature_matrix
+coordinates <- upec12$coordinates
+feature_metadata <- upec12$feature_metadata
+stopifnot(nrow(pixel_feature_matrix) == 7036L)
+stopifnot(nrow(feature_metadata) == 252L)
+```
+
+The observed UPEC_12 output contains 7,036 pixels and all 252 measured shared-axis
+features. UPEC_13, UPEC_14, and UPEC_15 also contain 252 features, and their numeric
+m/z axes match UPEC_12 exactly (maximum observed axis difference: 0 ppm).
+
+## Step 3: pixel and feature QC
+
+QC is performed on measured features before annotation. Coordinates must be finite
+and unique within a section; feature intensities must be finite and non-negative;
+zero-TIC pixels cannot enter normalization.
+
+```{r processing-step-3, eval=FALSE}
+feature_columns <- feature_metadata$column_name
+intensity <- as.matrix(pixel_feature_matrix[, feature_columns, drop = FALSE])
+
+stopifnot(all(is.finite(coordinates$x)), all(is.finite(coordinates$y)))
+stopifnot(!anyDuplicated(coordinates[c("section_id", "x", "y")]))
+stopifnot(all(is.finite(intensity)), all(intensity >= 0))
+
+tic <- rowSums(intensity)
+keep_pixel <- is.finite(tic) & tic > 0
+qc_summary <- data.frame(
+  input_pixels = nrow(intensity),
+  retained_pixels = sum(keep_pixel),
+  removed_nonpositive_tic = sum(!keep_pixel),
+  measured_features = ncol(intensity)
+)
+```
+
+## Step 4: TIC normalization and log1p transformation
+
+Each sample is normalized separately. Transformation order is recorded and fixed:
+per-pixel TIC normalization first, then `log1p`. Samples are not joined into one
+spatial graph.
+
+```{r processing-step-4, eval=FALSE}
+intensity <- intensity[keep_pixel, , drop = FALSE]
+tic <- tic[keep_pixel]
+tic_normalized <- intensity / tic
+analysis_matrix <- log1p(tic_normalized)
+stopifnot(all(is.finite(analysis_matrix)))
+
+processing_parameters <- list(
+  normalization = "per-pixel TIC",
+  transformation = "log1p",
+  transformation_order = "TIC normalization then log1p"
+)
+```
+
+## Step 5: standardized outputs and manifest
+
+One run writes the pixel-by-feature matrix, coordinates, feature metadata, QC,
+parameters, and provenance. These outputs are sufficient to restart analysis without
+re-reading raw binary arrays.
+
+```{r processing-step-5, eval=FALSE}
+standard_output <- "results/real_data/UPEC_12"
+write_pipeline_outputs(
+  output_dir = standard_output,
+  pixel_matrix = pixel_feature_matrix[keep_pixel, , drop = FALSE],
+  coordinates = coordinates[keep_pixel, , drop = FALSE],
+  feature_metadata = feature_metadata,
+  qc_summary = qc_summary,
+  processing_parameters = processing_parameters,
+  provenance = c(
+    upec12$provenance,
+    list(
+      polarity_cv_metadata_established = FALSE,
+      input_manifest = input_manifest
+    )
+  )
+)
+```
 
 # Data Analysis
 
-This section describes common analysis tasks performed after processing.
+The workflow answers four prespecified questions. Annotation is downstream of MSI
+measurement and never controls which of the 252 features enters spatial analysis.
 
-## Task 1: Spatially variable metabolites using Moran's I
+## Task 1: UPEC_12 spatially variable metabolites
 
-- Input: pixel-feature matrix and coordinates.
-- Function calls:
+The primary graph is symmetric binary Queen adjacency at distance
+(sqrt{2}); Rook adjacency at distance 1 is a sensitivity analysis. Isolated pixels
+do not enter the Moran mean, denominator, or permutations.
 
-```{r eval=FALSE}
-spatial <- compute_spatially_variable_metabolites(pixel_feature_matrix, coordinates)
+```{r analysis-task-1, eval=FALSE}
+queen <- build_spatial_neighbors(
+  coordinates$x, coordinates$y,
+  method = "queen", distance_threshold = sqrt(2),
+  weights = "binary", symmetric = TRUE
+)
+rook <- build_spatial_neighbors(
+  coordinates$x, coordinates$y,
+  method = "rook", distance_threshold = 1,
+  weights = "binary", symmetric = TRUE
+)
+
+queen_result <- compute_spatially_variable_metabolites(
+  pixel_matrix = data.frame(coordinates[c("x", "y")], analysis_matrix),
+  coordinates = coordinates,
+  n_perm = 499,
+  alternative = "two.sided",
+  p_adjust_method = "BH",
+  seed = 20260806,
+  neighbors = queen
+)
 ```
 
-- Output: a table of features with Moran's I and permutation p-values.
-- QC/Failures: ensure permutation counts > 0; check p-value finite.
+Observed diagnostics and results were:
 
-## Task 2: Spatial domains and ROI profiles
+| Metric | Queen | Rook |
+|---|---:|---:|
+| Total pixels | 7,036 | 7,036 |
+| Effective pixels | 6,992 | 6,935 |
+| Isolated pixels | 44 | 101 |
+| Undirected edges | 19,291 | 10,223 |
+| Connected components | 329 | 408 |
+| BH-FDR significant features | 184 | 166 |
 
-- Input: normalized matrix and optional image-derived features.
-- Function calls:
+Queen/Rook Moran rankings had Spearman correlation 0.97285. Their significant sets
+overlapped in 157 features with Jaccard 0.8135. With 499 permutations, the minimum
+attainable permutation p-value is (1/(499+1)=0.002); values at 0.002 indicate the
+permutation resolution limit, not zero probability.
 
-```{r eval=FALSE}
-clustered <- cluster_pixels(normalized, k = 3, pca_components = 10)
-# sample_subregions can be used to summarize ROI profiles by spatial subregions
-sampled <- sample_subregions(clustered$matrix, grid_size = 5, min_pixels = 30)
-profiles <- sampled$sample_matrix
+## Task 2: data-driven metabolic domains
+
+The archive's `umap_data.csv` labels are mapped by sample, x, and y with a strict
+one-to-one coordinate check. Values 0--2 are called data-driven metabolic domains;
+-1 remains unclassified/background.
+
+```{r analysis-task-2, eval=FALSE}
+domain_pixels <- map_spatial_domain_labels(
+  pixel_matrix = pixel_feature_matrix,
+  umap_path = file.path(root, "umap_data.csv"),
+  sample_id = "UPEC_12"
+)
+stopifnot(!anyNA(domain_pixels$domain_id))
+
+formal_domain_pixels <- domain_pixels$domain_id %in% 0:2
 ```
 
-- Output: domain segmentation map and per-region sample profiles.
+For UPEC_12, pixel counts were 485 in -1, 1,417 in domain 0, 688 in domain 1,
+and 4,446 in domain 2. Because these domains were learned from the same MSI feature
+space being characterized, domain contrasts have circularity risk and are not
+independent anatomical ROI validation.
 
-## Task 3: Differential analysis between tissue regions
+## Task 3: UPEC_12--UPEC_15 subject-paired domain characterization
 
-- Input: region-aggregated sample matrix and group labels.
-- Function calls:
+Each subject-by-domain-by-feature value is first reduced to one mean. Domain 0 versus
+1, 0 versus 2, and 1 versus 2 are then evaluated with subject-paired tests; pixels
+and tiles never enter the replicate count.
 
-```{r eval=FALSE}
-metabo_data <- make_metaboanalyst_data(sampled$sample_matrix)
-# export metabo_data to MetaboAnalyst or other differential analysis tools
-# result <- run_differential_analysis_in_metaboanalyst(metabo_data)
-# normalized <- normalize_metaboanalyst_result(result, source_name = "metaboanalyst")
+```{r analysis-task-3, eval=FALSE}
+# `subject_domain_matrix` has one row per subject x domain and feature columns.
+paired_domains <- differential_region_analysis(
+  sample_matrix = subject_domain_matrix,
+  group_column = "domain_id",
+  subject_column = "subject_id",
+  section_column = "section_id",
+  p_adjust_method = "BH"
+)
 ```
 
-- Output: a prepared data frame for differential analysis and normalized result import support.
+All four samples had complete coordinate/domain mappings. At (n=4), the exploratory
+BH-FDR counts were 59 features for domain 0 versus 1, 107 for domain 0 versus 2,
+and 0 for domain 1 versus 2. These small-sample paired results characterize the
+published data-driven domains; they do not establish anatomical regions or generalize
+beyond this proof-of-concept cohort.
 
-## Task 4: MSI–LC-MS/MS cross-validation using m/z, ppm and ion mode
+## Task 4: PC(O-16:0_20:4) fragment-level orthogonal support
 
-- Input: MSI feature table and LC-MS/MS identifications.
-- Function calls:
+Diagnostic ions are supplied explicitly. The function never assigns chemistry from
+an unlabelled peak. A core scan must satisfy both selected-precursor tolerance and
+isolation-window coverage. Profile-derived local maxima retain their extraction
+method, parameters, and software version.
 
-```{r eval=FALSE}
-matched <- cross_validate_msi_lcms(msi_features, lcms_features, ppm = 10)
+```{r analysis-task-4, eval=FALSE}
+pos_ions <- data.frame(
+  label = "phosphocholine_184_07",
+  target_mz = 184.07,
+  evidence_role = "positive_mode_PC_class_fragment"
+)
+pos_support <- validate_msms_fragment_evidence(
+  precursor_scans = pos_scan_metadata,
+  fragment_peaks = pos_fragment_peaks,
+  diagnostic_ions = pos_ions,
+  precursor_target = 768.5902,
+  precursor_ppm_tolerance = 10,
+  fragment_tolerance = 0.02,
+  fragment_tolerance_unit = "Da",
+  min_relative_intensity = 0.01,
+  min_core_scans = 2,
+  required_diagnostic_labels = "phosphocholine_184_07"
+)
+
+neg_ions <- data.frame(
+  label = c("M_minus_CH3_752_56", "FA_20_4_303_23",
+            "FA_20_4_minus_CO2_259_24", "dLPC_16_0_466_33"),
+  target_mz = c(752.56, 303.23, 259.24, 466.33),
+  evidence_role = c("additional_consistency", "20:4_acyl_chain",
+                    "additional_20:4_consistency", "16:0_lyso_fragment")
+)
+neg_support <- validate_msms_fragment_evidence(
+  precursor_scans = neg_scan_metadata,
+  fragment_peaks = neg_fragment_peaks,
+  diagnostic_ions = neg_ions,
+  precursor_target = 812.5811,
+  precursor_ppm_tolerance = 10,
+  fragment_tolerance = 0.02,
+  fragment_tolerance_unit = "Da",
+  min_relative_intensity = 0.01,
+  min_core_scans = 2,
+  required_diagnostic_labels = c("FA_20_4_303_23", "dLPC_16_0_466_33")
+)
 ```
 
-- Output: matched table with ppm error and direction agreement.
-- QC/Failures: apply numeric tolerance when comparing ppm boundaries; inspect unmatched features.
+The real POS file produced 17 selected-ion matches for 768.5902 and 10 core scans;
+184.07 reached repeated diagnostic support in all 10 core scans. The NEG file
+produced six selected-ion matches for the formate adduct 812.5811 and five core
+scans. Core scans meeting the 1% base-peak threshold numbered five for 752.56,
+four for 303.23, three for 259.24, and four for 466.33. Thus POS PC-class support,
+NEG 20:4 support, NEG 16:0 support, and the explicit overall rule were all `TRUE`.
 
-# Data downloads and example dataset
+The recommended result label is `fragment_level_orthogonal_support`. The source
+mzML marks these MS2 spectra as profile; local maxima were derived with
+`scipy.signal.find_peaks(prominence=0)` and are not vendor centroid data. The combined
+evidence is consistent with the paper-reported PC(O-16:0_20:4) assignment, but the
+LC-MS/MS dataset is companion rather than pixel-level or same-sample paired evidence.
 
-Quick example (small): download and extract `ly6g_heterogeneity_signatures.zip` from
-Zenodo (https://zenodo.org/records/11913042). For extended analyses, obtain the
-`region_group_analysis.zip` archive from the same record (large, ~3.1 GB) and
-follow the package's `inst/` or `data/` ingestion functions to prepare data.
+Putative accurate-mass annotations remain one-to-many and must retain the label
+`putative_accurate_mass_annotation`. Neither accurate-mass matching nor fragment-level
+orthogonal support should be converted into an unqualified structure claim.
 
-LC-MS/MS dataset accession used as example: MSV000096465
-
----
-
-Session info and package citation (render-time):
-
-```{r session, eval=FALSE}
+```{r session-info}
 sessionInfo()
-citation("SpatialOmicsMSI")
 ```
-
-<!-- end vignette -->
