@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-msms_fragment_evidence", {
 checking_installed_package <- nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))
 if (checking_installed_package) {
   library(SpatialOmicsMSI)
@@ -94,3 +95,6 @@ serialized <- tolower(paste(capture.output(dput(result)), collapse = " "))
 stopifnot(!grepl("confirmed", serialized, fixed = TRUE))
 
 cat("MSMS_FRAGMENT_EVIDENCE_TEST_OK=TRUE\n")
+
+  testthat::succeed()
+})

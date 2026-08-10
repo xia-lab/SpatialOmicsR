@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-neighborhood_enrichment", {
 if (nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))) {
   library(SpatialOmicsMSI)
 } else {
@@ -41,3 +42,6 @@ grouped <- group_cell_types_from_enrichment(synthetic, k_groups = 2)
 stopifnot(grouped$groups$interaction_profile_group[1] == grouped$groups$interaction_profile_group[2])
 stopifnot(grouped$groups$interaction_profile_group[1] != grouped$groups$interaction_profile_group[3])
 stopifnot(grepl("not spatial niches", grouped$interpretation, fixed = TRUE))
+
+  testthat::succeed()
+})

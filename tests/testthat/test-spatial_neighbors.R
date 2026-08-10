@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-spatial_neighbors", {
 checking_installed_package <- nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))
 if (checking_installed_package) {
   library(SpatialOmicsMSI)
@@ -100,3 +101,6 @@ stopifnot(all(c("summary", "degree_distribution", "component_sizes") %in% unique
 stopifnot(all(c("n_nodes", "n_effective", "n_isolated", "n_edges_undirected") %in% diagnostics$metric))
 
 cat("SPATIAL_NEIGHBOR_TEST_OK=TRUE\n")
+
+  testthat::succeed()
+})

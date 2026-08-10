@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-variable_mz_adapter", {
 checking_installed_package <- nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))
 if (dir.exists(".lib")) .libPaths(c(normalizePath(".lib"), .libPaths()))
 if (checking_installed_package) library(SpatialOmicsMSI) else {
@@ -40,3 +41,6 @@ if (!checking_installed_package && run_real_data_tests && requireNamespace("Card
   }
 }
 cat("VARIABLE_MZ_ADAPTER_TEST_OK=TRUE\n")
+
+  testthat::succeed()
+})

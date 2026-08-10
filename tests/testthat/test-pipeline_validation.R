@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-pipeline_validation", {
 orig_wd <- getwd()
 checking_installed_package <- nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))
 if (checking_installed_package) {
@@ -333,3 +334,6 @@ stopifnot(all(c("feature", "morans_i", "p_value", "adj_p_value") %in% names(spat
 stopifnot(nrow(spatial) == length(feature_cols))
 
 cat("PIPELINE_TEST_OK=TRUE\n")
+
+  testthat::succeed()
+})

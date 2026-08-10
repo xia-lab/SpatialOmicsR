@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-niche_analysis", {
 if (nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))) {
   library(SpatialOmicsMSI)
 } else {
@@ -56,3 +57,6 @@ too_small_failed <- tryCatch({
   FALSE
 }, error = function(e) TRUE)
 stopifnot(too_small_failed)
+
+  testthat::succeed()
+})

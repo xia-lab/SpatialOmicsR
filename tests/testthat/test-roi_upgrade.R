@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-roi_upgrade", {
 checking_installed_package <- nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))
 if (checking_installed_package) {
   library(SpatialOmicsMSI)
@@ -111,3 +112,6 @@ stopifnot(!any(lmd_qc$qc_pass))
 stopifnot(grepl("Read-only", attr(lmd_qc, "scope"), fixed = TRUE))
 
 cat("ROI_UPGRADE_TEST_OK=TRUE\n")
+
+  testthat::succeed()
+})

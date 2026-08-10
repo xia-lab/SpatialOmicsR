@@ -6,23 +6,23 @@ if (!file.exists(file.path(project_root, "DESCRIPTION"))) {
   stop("Run this script from the repository root or pass the root as its first argument.", call. = FALSE)
 }
 
-test_files <- sort(list.files(file.path(project_root, "tests"), pattern = "\\.R$", full.names = TRUE))
-if (!length(test_files)) stop("No tests were found.", call. = FALSE)
-
-failures <- character()
-for (test_file in test_files) {
-  cat("\n=== ", basename(test_file), " ===\n", sep = "")
-  status <- system2(
-    file.path(R.home("bin"), "Rscript"),
-    shQuote(test_file),
-    stdout = "",
-    stderr = "",
-    env = paste0("SPATIALOMICS_PROJECT_ROOT=", shQuote(project_root))
-  )
-  if (!identical(status, 0L)) failures <- c(failures, basename(test_file))
+if (!requireNamespace("testthat", quietly = TRUE)) {
+  stop("Package 'testthat' (>= 3.0.0) is required. Install it before running tests.", call. = FALSE)
 }
-
-if (length(failures)) {
-  stop("Test failure(s): ", paste(failures, collapse = ", "), call. = FALSE)
+Sys.setenv(SPATIALOMICS_PROJECT_ROOT = project_root)
+temporary_library <- tempfile("spatialomics-test-library-")
+dir.create(temporary_library, recursive = TRUE)
+on.exit(unlink(temporary_library, recursive = TRUE, force = TRUE), add = TRUE)
+install_status <- system2(
+  file.path(R.home("bin"), "R"),
+  c("CMD", "INSTALL", "--no-multiarch", "--with-keep.source",
+    paste0("--library=", shQuote(temporary_library)), shQuote(project_root)),
+  stdout = "", stderr = ""
+)
+if (!identical(install_status, 0L)) {
+  stop("Temporary installation failed; tests were not run.", call. = FALSE)
 }
+.libPaths(c(temporary_library, .libPaths()))
+Sys.setenv(`_R_CHECK_PACKAGE_NAME_` = "SpatialOmicsMSI")
+testthat::test_dir(file.path(project_root, "tests", "testthat"), reporter = "summary")
 cat("\nALL_TESTS_OK=TRUE\n")

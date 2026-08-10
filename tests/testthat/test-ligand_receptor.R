@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-ligand_receptor", {
 if (nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))) {
   library(SpatialOmicsMSI)
 } else {
@@ -119,3 +120,6 @@ cross_dropped <- cell_proximity_enrichment(
 stopifnot(cross_dropped$settings$n_cross_stratum_edges_dropped == 1L)
 
 cat("LIGAND_RECEPTOR_TEST_OK=TRUE\n")
+
+  testthat::succeed()
+})

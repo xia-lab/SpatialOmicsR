@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-geary_spatial_variability", {
 if (nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))) {
   library(SpatialOmicsMSI)
 } else {
@@ -40,3 +41,6 @@ stopifnot(all(c("feature", "gearys_c", "p_value", "adj_p_value") %in% names(gear
 comparison <- compare_moran_geary(moran, geary)
 stopifnot(nrow(comparison) == 2L)
 stopifnot(nzchar(attr(comparison, "interpretation")))
+
+  testthat::succeed()
+})

@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-spatial_clustering", {
 if (nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))) {
   library(SpatialOmicsMSI)
 } else {
@@ -38,3 +39,6 @@ diagnostics <- cluster_diagnostics_spatial(
 stopifnot(nrow(diagnostics) == 3L)
 stopifnot(all(diagnostics$adjacent_pair_agreement >= 0 & diagnostics$adjacent_pair_agreement <= 1))
 stopifnot(nzchar(attr(diagnostics, "interpretation")))
+
+  testthat::succeed()
+})

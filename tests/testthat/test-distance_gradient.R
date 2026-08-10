@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-distance_gradient", {
 if (nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))) {
   library(SpatialOmicsMSI)
 } else {
@@ -125,3 +126,6 @@ if (requireNamespace("mgcv", quietly = TRUE)) {
   stopifnot(identical(integrated$continuous_result$status, "fitted"))
   stopifnot(!is.null(integrated$discrete_result))
 }
+
+  testthat::succeed()
+})

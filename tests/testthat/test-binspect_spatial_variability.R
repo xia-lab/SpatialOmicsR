@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-binspect_spatial_variability", {
 if (nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))) {
   library(SpatialOmicsMSI)
 } else {
@@ -50,3 +51,6 @@ comparison <- compare_svg_methods(
 stopifnot(nrow(comparison) == 2L)
 stopifnot(all(comparison$n_methods_tested == 3L))
 stopifnot(nzchar(attr(comparison, "interpretation")))
+
+  testthat::succeed()
+})

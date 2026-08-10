@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-mzml_adapter", {
 checking_installed_package <- nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))
 if (dir.exists(".lib")) .libPaths(c(normalizePath(".lib"), .libPaths()))
 if (checking_installed_package) library(SpatialOmicsMSI) else {
@@ -30,3 +31,6 @@ if (requireNamespace("base64enc", quietly = TRUE)) {
 } else {
   cat("MZML_ADAPTER_TEST_SKIPPED_BASE64ENC=TRUE\n")
 }
+
+  testthat::succeed()
+})

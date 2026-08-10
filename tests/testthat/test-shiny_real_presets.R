@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-shiny_real_presets", {
 if (dir.exists(".lib")) .libPaths(c(normalizePath(".lib"), .libPaths()))
 if (!requireNamespace("shiny", quietly = TRUE)) { cat("SHINY_GENERAL_APP_SKIPPED=TRUE\n"); quit(status = 0) }
 checking_installed_package <- nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))
@@ -104,3 +105,6 @@ shiny::testServer(env$server, {
 })
 if (is.na(old)) Sys.unsetenv("SPATIALOMICS_PROJECT_ROOT") else Sys.setenv(SPATIALOMICS_PROJECT_ROOT = old)
 cat("SHINY_GENERAL_APP_TEST_OK=TRUE\n")
+
+  testthat::succeed()
+})

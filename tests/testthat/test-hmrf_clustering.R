@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-hmrf_clustering", {
 if (nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))) {
   library(SpatialOmicsMSI)
 } else {
@@ -57,3 +58,6 @@ smoothness <- cluster_diagnostics_hmrf(
   update_order = "fixed", seed = 9
 )
 stopifnot(smoothness$boundary_edge_fraction[2] < smoothness$boundary_edge_fraction[1])
+
+  testthat::succeed()
+})

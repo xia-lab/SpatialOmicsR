@@ -134,6 +134,10 @@ Run the dependency-light regression suite:
 Rscript scripts/run_tests.R
 ```
 
+Tests follow the standard `testthat` layout under `tests/testthat/`. Small
+synthetic fixtures may be committed there; tests using local raw datasets remain
+explicitly opt-in.
+
 Run a package check when all declared dependencies are installed:
 
 ```bash

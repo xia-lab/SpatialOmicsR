@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-spatial_lmm", {
 if (nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))) {
   library(SpatialOmicsMSI)
 } else {
@@ -87,3 +88,6 @@ alias_fit <- withCallingHandlers(
 )
 stopifnot(grepl("compatibility alias", alias_warning, fixed = TRUE))
 stopifnot(is.list(alias_fit))
+
+  testthat::succeed()
+})

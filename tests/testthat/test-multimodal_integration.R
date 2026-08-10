@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-multimodal_integration", {
 orig_wd <- getwd()
 checking_installed_package <- nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))
 if (checking_installed_package) {
@@ -91,3 +92,6 @@ stopifnot(comparison$n_pairs == 5L, abs(comparison$correlation - 1) < 1e-12)
 stopifnot(comparison$lcm_area_normalized, comparison$lcm_internal_standard_normalized)
 
 cat("MULTIMODAL_INTEGRATION_TEST_OK=TRUE\n")
+
+  testthat::succeed()
+})

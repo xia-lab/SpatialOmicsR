@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-metaspace_registration", {
 checking_installed_package <- nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))
 if (dir.exists(".lib")) .libPaths(c(normalizePath(".lib"), .libPaths()))
 if (checking_installed_package) {
@@ -55,3 +56,6 @@ if (!checking_installed_package && run_real_data_tests) {
   }
 }
 cat("METASPACE_REGISTRATION_TEST_OK=TRUE\n")
+
+  testthat::succeed()
+})

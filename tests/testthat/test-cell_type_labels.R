@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-cell_type_labels", {
 if (nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))) {
   library(SpatialOmicsMSI)
 } else {
@@ -63,3 +64,6 @@ if (requireNamespace("EBImage", quietly = TRUE)) {
   stopifnot(all(grepl("^morphology_class_", morphology$labels$cell_type)))
   stopifnot(all(morphology$labels$confidence >= 0.5 & morphology$labels$confidence <= 1))
 }
+
+  testthat::succeed()
+})

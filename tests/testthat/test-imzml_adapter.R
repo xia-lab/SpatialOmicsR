@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-imzml_adapter", {
 checking_installed_package <- nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))
 if (checking_installed_package) {
   library(SpatialOmicsMSI)
@@ -171,3 +172,6 @@ if (!is.null(project_root) && run_real_data_tests && requireNamespace("Cardinal"
 }
 
 cat("IMZML_ADAPTER_TEST_OK=TRUE\n")
+
+  testthat::succeed()
+})

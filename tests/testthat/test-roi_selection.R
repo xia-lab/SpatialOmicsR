@@ -1,3 +1,4 @@
+testthat::test_that("regression: test-roi_selection", {
 if (nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))) {
   library(SpatialOmicsMSI)
 } else {
@@ -180,3 +181,6 @@ stopifnot(
   nrow(selected_samples$sample_matrix) > 0,
   all(c("polyA", "polyB") %in% unique(selected_samples$sample_mapping$roi_id))
 )
+
+  testthat::succeed()
+})
