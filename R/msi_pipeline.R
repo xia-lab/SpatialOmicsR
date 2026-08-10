@@ -2738,7 +2738,11 @@ compute_neighborhood_composition <- function(cell_type_labels,
                                              cell_types = NULL,
                                              pixel_id = seq_along(cell_type_labels),
                                              region_id = rep("region_1", length(cell_type_labels)),
-                                             include_self = TRUE) {
+                                             include_self = TRUE,
+                                             neighborhood = c("knn", "radius"),
+                                             radius = NULL,
+                                             min_neighbors = 1) {
+  neighborhood <- match.arg(neighborhood)
   n <- length(cell_type_labels)
   if (n == 0L || length(x) != n || length(y) != n ||
       length(pixel_id) != n || length(region_id) != n) {
@@ -2765,6 +2769,15 @@ compute_neighborhood_composition <- function(cell_type_labels,
   if (length(include_self) != 1L || is.na(include_self)) {
     stop("include_self must be TRUE or FALSE.", call. = FALSE)
   }
+  if (length(min_neighbors) != 1L || !is.finite(min_neighbors) ||
+      min_neighbors < 1 || min_neighbors != as.integer(min_neighbors)) {
+    stop("min_neighbors must be one positive integer.", call. = FALSE)
+  }
+  min_neighbors <- as.integer(min_neighbors)
+  if (neighborhood == "radius" &&
+      (length(radius) != 1L || !is.finite(radius) || radius <= 0)) {
+    stop("radius must be one positive finite value for a radius neighborhood.", call. = FALSE)
+  }
   k <- as.integer(k)
   labels <- as.character(cell_type_labels)
   if (is.null(cell_types)) {
@@ -2784,7 +2797,7 @@ compute_neighborhood_composition <- function(cell_type_labels,
   region_sizes <- table(region)
   minimum_size <- k + if (isTRUE(include_self)) 0L else 1L
   too_small <- names(region_sizes)[region_sizes < minimum_size]
-  if (length(too_small) > 0L) {
+  if (neighborhood == "knn" && length(too_small) > 0L) {
     stop(
       "Each region must contain at least ", minimum_size,
       " positions for this k/include_self setting. Too small: ",
@@ -2797,33 +2810,68 @@ compute_neighborhood_composition <- function(cell_type_labels,
   composition_columns <- paste0("composition__", safe_type_names)
   count_matrix <- matrix(0L, nrow = n, ncol = length(cell_types))
   colnames(count_matrix) <- composition_columns
-  neighbor_indices <- matrix(NA_integer_, nrow = n, ncol = k)
+  neighbor_indices <- if (neighborhood == "knn") {
+    matrix(NA_integer_, nrow = n, ncol = k)
+  } else {
+    vector("list", n)
+  }
+  neighbor_count <- integer(n)
   x_numeric <- as.numeric(x)
   y_numeric <- as.numeric(y)
 
   for (region_name in unique(region)) {
     region_indices <- which(region == region_name)
+    radius_buckets <- NULL
+    bucket_x <- bucket_y <- NULL
+    if (neighborhood == "radius") {
+      bucket_x <- floor(x_numeric[region_indices] / radius)
+      bucket_y <- floor(y_numeric[region_indices] / radius)
+      radius_buckets <- split(region_indices, paste(bucket_x, bucket_y, sep = "\r"))
+      names(bucket_x) <- names(bucket_y) <- region_indices
+    }
     for (i in region_indices) {
-      candidates <- setdiff(region_indices, i)
+      candidates <- if (neighborhood == "knn") {
+        setdiff(region_indices, i)
+      } else {
+        nearby_keys <- as.vector(outer(
+          bucket_x[as.character(i)] + (-1:1),
+          bucket_y[as.character(i)] + (-1:1),
+          paste, sep = "\r"
+        ))
+        setdiff(unlist(radius_buckets[nearby_keys], use.names = FALSE), i)
+      }
       distance_squared <- (x_numeric[candidates] - x_numeric[i])^2 +
         (y_numeric[candidates] - y_numeric[i])^2
       ordered_candidates <- candidates[order(distance_squared, candidates)]
-      selected <- if (isTRUE(include_self)) {
+      selected <- if (neighborhood == "knn" && isTRUE(include_self)) {
         c(i, ordered_candidates[seq_len(k - 1L)])
-      } else {
+      } else if (neighborhood == "knn") {
         ordered_candidates[seq_len(k)]
+      } else {
+        within_radius <- ordered_candidates[
+          distance_squared[match(ordered_candidates, candidates)] <=
+            radius^2 + sqrt(.Machine$double.eps)
+        ]
+        if (isTRUE(include_self)) c(i, within_radius) else within_radius
       }
-      neighbor_indices[i, ] <- selected
+      if (neighborhood == "knn") neighbor_indices[i, ] <- selected else neighbor_indices[[i]] <- selected
+      neighbor_count[i] <- length(selected)
       count_matrix[i, ] <- tabulate(match(labels[selected], cell_types), nbins = length(cell_types))
     }
   }
 
-  composition_matrix <- count_matrix / k
+  eligible <- neighbor_count >= min_neighbors
+  composition_matrix <- matrix(NA_real_, nrow = n, ncol = length(cell_types))
+  colnames(composition_matrix) <- composition_columns
+  composition_matrix[eligible, ] <- count_matrix[eligible, , drop = FALSE] / neighbor_count[eligible]
   matrix_output <- data.frame(
     pixel_id = pixel_id,
     region_id = region,
     focal_cell_type = labels,
-    window_size = rep(k, n),
+    window_size = neighbor_count,
+    n_neighbors = neighbor_count,
+    eligible = eligible,
+    exclusion_reason = ifelse(eligible, NA_character_, "below_min_neighbors"),
     composition_matrix,
     check.names = FALSE,
     stringsAsFactors = FALSE
@@ -2839,7 +2887,12 @@ compute_neighborhood_composition <- function(cell_type_labels,
       counts = count_matrix,
       neighbor_indices = neighbor_indices,
       cell_type_mapping = mapping,
-      settings = list(k = k, include_self = isTRUE(include_self), region_column = "region_id")
+      settings = list(
+        neighborhood = neighborhood, k = if (neighborhood == "knn") k else NULL,
+        radius = if (neighborhood == "radius") radius else NULL,
+        min_neighbors = min_neighbors, include_self = isTRUE(include_self),
+        region_column = "region_id"
+      )
     ),
     class = "neighborhood_composition"
   )
@@ -2850,7 +2903,10 @@ define_niches <- function(composition,
                           nstart = 25,
                           iter.max = 100,
                           algorithm = "Lloyd",
-                          seed = 1) {
+                          seed = 1,
+                          transform = c("hellinger", "none", "clr"),
+                          clr_pseudocount = 1e-6) {
+  transform <- match.arg(transform)
   if (inherits(composition, "neighborhood_composition")) {
     composition_matrix <- composition$matrix
     composition_columns <- composition$cell_type_mapping$composition_column
@@ -2866,19 +2922,40 @@ define_niches <- function(composition,
   }
   values <- as.matrix(composition_matrix[, composition_columns, drop = FALSE])
   storage.mode(values) <- "double"
-  if (nrow(values) < 2L || any(!is.finite(values)) || any(values < 0)) {
-    stop("Composition values must be a finite, non-negative matrix with at least two rows.", call. = FALSE)
+  eligible <- if ("eligible" %in% names(composition_matrix)) {
+    as.logical(composition_matrix$eligible)
+  } else {
+    rep(TRUE, nrow(values))
   }
-  row_totals <- rowSums(values)
+  eligible[is.na(eligible)] <- FALSE
+  eligible <- eligible & apply(values, 1L, function(row) all(is.finite(row) & row >= 0))
+  if (sum(eligible) < 2L) {
+    stop("At least two eligible finite composition rows are required.", call. = FALSE)
+  }
+  row_totals <- rowSums(values[eligible, , drop = FALSE])
   if (any(abs(row_totals - 1) > sqrt(.Machine$double.eps))) {
     stop("Each neighborhood composition row must sum to one.", call. = FALSE)
+  }
+  if (transform == "clr" &&
+      (length(clr_pseudocount) != 1L || !is.finite(clr_pseudocount) || clr_pseudocount <= 0)) {
+    stop("clr_pseudocount must be one positive finite value.", call. = FALSE)
   }
   if (length(k_niches) != 1L || !is.finite(k_niches) ||
       k_niches < 2 || k_niches != as.integer(k_niches)) {
     stop("k_niches must be one integer of at least two.", call. = FALSE)
   }
   k_niches <- as.integer(k_niches)
-  unique_profiles <- nrow(unique(as.data.frame(values, check.names = FALSE)))
+  fit_values <- values[eligible, , drop = FALSE]
+  transformed_values <- switch(
+    transform,
+    hellinger = sqrt(fit_values),
+    none = fit_values,
+    clr = {
+      logged <- log(fit_values + clr_pseudocount)
+      logged - rowMeans(logged)
+    }
+  )
+  unique_profiles <- nrow(unique(as.data.frame(transformed_values, check.names = FALSE)))
   if (k_niches > unique_profiles) {
     stop(
       "k_niches cannot exceed the number of distinct composition profiles (",
@@ -2888,30 +2965,147 @@ define_niches <- function(composition,
   }
   if (!is.null(seed)) set.seed(seed)
   fit <- stats::kmeans(
-    values,
+    transformed_values,
     centers = k_niches,
     nstart = nstart,
     iter.max = iter.max,
     algorithm = algorithm
   )
   output <- composition_matrix
-  output$niche_id <- as.integer(fit$cluster)
-  output$niche_label <- paste0("niche_", fit$cluster)
+  output$niche_id <- NA_integer_
+  output$niche_id[eligible] <- as.integer(fit$cluster)
+  output$niche_label <- ifelse(is.na(output$niche_id), NA_character_, paste0("niche_", output$niche_id))
+  distances <- vapply(seq_len(nrow(transformed_values)), function(i) {
+    sqrt(rowSums((fit$centers - transformed_values[i, ])^2))
+  }, numeric(k_niches))
+  if (k_niches == 1L) distances <- matrix(distances, nrow = 1L)
+  ordered_distances <- apply(distances, 2L, sort)
+  output$nearest_centroid_distance <- NA_real_
+  output$second_centroid_distance <- NA_real_
+  output$ambiguity_ratio <- NA_real_
+  output$nearest_centroid_distance[eligible] <- ordered_distances[1L, ]
+  output$second_centroid_distance[eligible] <- ordered_distances[2L, ]
+  ratio <- ordered_distances[1L, ] / ordered_distances[2L, ]
+  ratio[ordered_distances[2L, ] == 0] <- ifelse(ordered_distances[1L, ] == 0, 1, Inf)
+  output$ambiguity_ratio[eligible] <- ratio
+  composition_centers <- rowsum(values[eligible, , drop = FALSE], fit$cluster) /
+    as.numeric(table(factor(fit$cluster, levels = seq_len(k_niches))))
   list(
     matrix = output,
     fit = fit,
     centers = fit$centers,
+    composition_centers = composition_centers,
     composition_columns = composition_columns,
     settings = list(
       k_niches = k_niches,
       nstart = nstart,
       iter.max = iter.max,
       algorithm = algorithm,
-      seed = seed
+      seed = seed,
+      transform = transform,
+      clr_pseudocount = if (transform == "clr") clr_pseudocount else NULL
     ),
     interpretation = paste(
       "Niche numbers are arbitrary k-means labels, not ordered biological identities;",
       "annotate them from their cell-type composition centers."
+    )
+  )
+}
+
+detect_spatial_niches <- function(pixel_matrix,
+                                  domain_column,
+                                  x_col = "x",
+                                  y_col = "y",
+                                  subject_column = NULL,
+                                  section_column = NULL,
+                                  neighborhood = c("radius", "knn"),
+                                  radius = NULL,
+                                  k = 10,
+                                  include_self = TRUE,
+                                  min_neighbors = 3,
+                                  transform = c("hellinger", "none", "clr"),
+                                  clr_pseudocount = 1e-6,
+                                  k_niches,
+                                  domain_alignment = c("joint", "aligned"),
+                                  seed = 1,
+                                  nstart = 25,
+                                  iter.max = 100,
+                                  algorithm = "Lloyd") {
+  neighborhood <- match.arg(neighborhood)
+  transform <- match.arg(transform)
+  domain_alignment <- match.arg(domain_alignment)
+  grouping_columns <- c(subject_column, section_column)
+  grouping_columns <- grouping_columns[!vapply(grouping_columns, is.null, logical(1))]
+  required_columns(
+    pixel_matrix,
+    unique(c(domain_column, x_col, y_col, grouping_columns)),
+    "Pixel/domain matrix"
+  )
+  if (length(domain_column) != 1L || length(x_col) != 1L || length(y_col) != 1L) {
+    stop("domain_column, x_col, and y_col must each name one column.", call. = FALSE)
+  }
+  if (anyNA(pixel_matrix[[domain_column]]) ||
+      any(!nzchar(as.character(pixel_matrix[[domain_column]])))) {
+    stop("Domain labels must be non-missing and non-empty.", call. = FALSE)
+  }
+  if (length(grouping_columns) &&
+      any(vapply(pixel_matrix[grouping_columns], function(value) {
+        anyNA(value) || any(!nzchar(as.character(value)))
+      }, logical(1)))) {
+    stop("Subject and section identifiers must be non-missing and non-empty.", call. = FALSE)
+  }
+  region_id <- if (!length(grouping_columns)) {
+    rep(".__single_field__", nrow(pixel_matrix))
+  } else {
+    do.call(paste, c(lapply(pixel_matrix[grouping_columns], as.character), sep = "\r"))
+  }
+  pixel_id <- if ("pixel_id" %in% names(pixel_matrix)) pixel_matrix$pixel_id else seq_len(nrow(pixel_matrix))
+  composition <- compute_neighborhood_composition(
+    cell_type_labels = pixel_matrix[[domain_column]],
+    x = pixel_matrix[[x_col]], y = pixel_matrix[[y_col]], k = k,
+    pixel_id = pixel_id, region_id = region_id, include_self = include_self,
+    neighborhood = neighborhood, radius = radius, min_neighbors = min_neighbors
+  )
+  niches <- define_niches(
+    composition, k_niches = k_niches, nstart = nstart, iter.max = iter.max,
+    algorithm = algorithm, seed = seed, transform = transform,
+    clr_pseudocount = clr_pseudocount
+  )
+  annotated <- pixel_matrix
+  niche_columns <- c(
+    "n_neighbors", "eligible", "exclusion_reason", "niche_id", "niche_label",
+    "nearest_centroid_distance", "second_centroid_distance", "ambiguity_ratio"
+  )
+  annotated[niche_columns] <- niches$matrix[niche_columns]
+  split_field <- split(seq_len(nrow(annotated)), region_id)
+  exclusion_summary <- do.call(rbind, lapply(names(split_field), function(field) {
+    index <- split_field[[field]]
+    excluded <- !annotated$eligible[index]
+    data.frame(
+      field_id = field, n_pixels = length(index), n_eligible = sum(!excluded),
+      n_excluded = sum(excluded), excluded_fraction = mean(excluded),
+      stringsAsFactors = FALSE
+    )
+  }))
+  rownames(exclusion_summary) <- NULL
+  list(
+    matrix = annotated,
+    composition = composition,
+    fit = niches$fit,
+    centers = niches$centers,
+    composition_centers = niches$composition_centers,
+    exclusion_summary = exclusion_summary,
+    settings = c(niches$settings, list(
+      neighborhood = neighborhood, radius = radius, k = k,
+      include_self = include_self, min_neighbors = min_neighbors,
+      domain_column = domain_column, x_col = x_col, y_col = y_col,
+      subject_column = subject_column, section_column = section_column,
+      domain_alignment = domain_alignment
+    )),
+    interpretation = paste(
+      niches$interpretation,
+      "Neighborhoods were confined to the declared subject-section fields.",
+      "Domain labels were declared", domain_alignment, "across fields."
     )
   )
 }

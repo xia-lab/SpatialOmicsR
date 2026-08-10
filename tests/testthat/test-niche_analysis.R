@@ -58,5 +58,39 @@ too_small_failed <- tryCatch({
 }, error = function(e) TRUE)
 stopifnot(too_small_failed)
 
+# Radius neighborhoods use physical coordinates, never cross section boundaries,
+# and exclude undersupported edge pixels from niche fitting.
+radius_input <- data.frame(
+  pixel_id = paste0("r", 1:8),
+  section_id = rep(c("section_a", "section_b"), each = 4),
+  x = rep(0:3, 2),
+  y = c(rep(0, 4), rep(100, 4)),
+  domain = rep(c("A", "A", "B", "B"), 2),
+  stringsAsFactors = FALSE
+)
+radius_result <- detect_spatial_niches(
+  radius_input,
+  domain_column = "domain",
+  section_column = "section_id",
+  neighborhood = "radius",
+  radius = 1.1,
+  include_self = TRUE,
+  min_neighbors = 3,
+  transform = "hellinger",
+  k_niches = 2,
+  domain_alignment = "joint",
+  seed = 23
+)
+stopifnot(identical(radius_result$matrix$eligible, rep(c(FALSE, TRUE, TRUE, FALSE), 2)))
+stopifnot(all(is.na(radius_result$matrix$niche_id[!radius_result$matrix$eligible])))
+stopifnot(all(!is.na(radius_result$matrix$niche_id[radius_result$matrix$eligible])))
+stopifnot(all(radius_result$matrix$ambiguity_ratio[radius_result$matrix$eligible] >= 0))
+stopifnot(all(radius_result$matrix$ambiguity_ratio[radius_result$matrix$eligible] <= 1))
+stopifnot(all(vapply(radius_result$composition$neighbor_indices[1:4], function(z) all(z <= 4), logical(1))))
+stopifnot(all(vapply(radius_result$composition$neighbor_indices[5:8], function(z) all(z >= 5), logical(1))))
+stopifnot(all(radius_result$exclusion_summary$n_excluded == 2L))
+stopifnot(identical(radius_result$settings$transform, "hellinger"))
+stopifnot(identical(radius_result$settings$domain_alignment, "joint"))
+
   testthat::succeed()
 })
