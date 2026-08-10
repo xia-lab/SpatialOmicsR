@@ -55,7 +55,14 @@ failed_without_distance <- tryCatch({
 stopifnot(failed_without_distance)
 
 if (requireNamespace("EBImage", quietly = TRUE)) {
-  image_path <- system.file("images", "nuclei.tif", package = "EBImage")
+  stack_path <- system.file("images", "nuclei.tif", package = "EBImage")
+  image_stack <- EBImage::readImage(stack_path)
+  # EBImage's example is a multi-frame TIFF. The public API deliberately
+  # requires one unambiguous histology frame, so isolate one frame as a
+  # temporary fixture instead of silently choosing a frame in production.
+  image_frame <- if (length(dim(image_stack)) > 2L) image_stack[, , 1L] else image_stack
+  image_path <- tempfile(fileext = ".tif")
+  EBImage::writeImage(image_frame, image_path)
   morphology <- segment_cells_from_histology(
     image_path, min_nucleus_size = 5, max_nucleus_size = 5000,
     n_morphology_classes = 2, seed = 3
