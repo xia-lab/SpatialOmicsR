@@ -26,6 +26,7 @@ spatial_samples$mz_100 <-
   0.05 * spatial_samples$x_center + stats::rnorm(nrow(spatial_samples), sd = 0.15)
 spatial_samples$mz_200 <-
   unname(subject_effect[spatial_samples$subject_id]) +
+  0.05 * (spatial_samples$y_center - mean(spatial_samples$y_center)) +
   stats::rnorm(nrow(spatial_samples), sd = 0.2)
 
 fit <- differential_region_analysis_spatial_lmm(
