@@ -333,16 +333,44 @@ ui <- navbarPage(
     uiOutput("domain_action"), tags$div(class = "alert alert-warning",
       "Pseudoreplication warning: pixels are not biological replicates. Generated domains are descriptive and data-driven, never anatomical ROI."),
     uiOutput("domain_gate"), plotOutput("domain_plot", height = 600), DTOutput("domain_counts"), DTOutput("domain_features"), uiOutput("domain_download")),
-  tabPanel("6 Moran's I", selectInput("neighbor_method", "Adjacency", c("Queen" = "queen", "Rook" = "rook")),
+  tabPanel("6 Cross-modal ROI validation",
+    tags$div(class = "alert alert-info",
+      "Compare the active spatial-domain labels with an independently generated label map. This validates label agreement; it does not turn exploratory clusters into anatomical ground truth."),
+    fileInput("corroboration_csv", "Independent ROI/domain CSV (x, y and a label column)", accept = ".csv"),
+    selectInput("corroboration_mapping", "Mapping rule",
+      c("Mutual best match" = "mutual_best", "One-way best match" = "one_way")),
+    fluidRow(
+      column(6, numericInput("corroboration_fraction", "Minimum conditional overlap", 0.5, min = 0, max = 1, step = 0.05)),
+      column(6, numericInput("corroboration_count", "Minimum shared pixels", 10, min = 1, step = 1))
+    ),
+    uiOutput("corroboration_action"), uiOutput("corroboration_gate"),
+    DTOutput("corroboration_pairs"), plotOutput("corroboration_plot", height = 600),
+    uiOutput("corroboration_download")),
+  tabPanel("7 Moran's I", selectInput("neighbor_method", "Adjacency", c("Queen" = "queen", "Rook" = "rook")),
     numericInput("permutations", "Two-sided permutations", 499, min = 99, step = 100), uiOutput("moran_action"),
     tags$details(tags$summary("Technical details — load a previously generated result"),
       textInput("moran_result_dir", "Result directory", Sys.getenv("SPATIALOMICS_OMIX_MORAN_DIR", "")), actionButton("load_moran", "Load result")),
     uiOutput("moran_gate"), DTOutput("neighbor_table"), DTOutput("moran_table"), plotOutput("ion_plot", height = 600)),
-  tabPanel("7 LC-MS/MS evidence", numericInput("msi_mz", "MSI observed m/z", 775.55261535, step = .00000001),
+  tabPanel("8 Multimodal evidence", numericInput("msi_mz", "MSI observed m/z", 775.55261535, step = .00000001),
     numericInput("lcms_precursor", "LC-MS/MS precursor target", 775.550137928655, step = .000000000001), uiOutput("lcms_action"),
     tags$p("Precursor-level match and an unassigned fragment spectrum are shown. Chemical identity is never inferred without user-supplied diagnostic-ion definitions."),
-    uiOutput("lcms_gate"), DTOutput("precursor_table"), plotOutput("fragment_plot", height = 520)),
-  tabPanel("8 Download results", tags$p("Each session writes to a unique temporary directory; source data are read-only."),
+    uiOutput("lcms_gate"), DTOutput("precursor_table"), plotOutput("fragment_plot", height = 520),
+    hr(), h3("MSI–LC-MS feature-table matching"),
+    tags$p("Both CSV files require an mz column. Optional shared ion_mode and log2fc columns add polarity filtering and direction agreement. Matching is one-to-one."),
+    fluidRow(column(6, fileInput("msi_feature_csv", "MSI feature CSV", accept = ".csv")),
+      column(6, fileInput("lcms_feature_csv", "LC-MS feature CSV", accept = ".csv"))),
+    fluidRow(column(6, numericInput("feature_match_ppm", "m/z tolerance (ppm)", 5, min = 0, step = 0.5)),
+      column(6, selectInput("assignment_method", "Assignment", c("Optimal (recommended)" = "optimal", "Greedy" = "greedy")))),
+    actionButton("run_feature_matching", "Match feature tables", class = "btn-primary"),
+    uiOutput("feature_match_gate"), DTOutput("feature_match_table"), uiOutput("feature_match_download"),
+    hr(), h3("CCS / ion-mobility evidence"),
+    tags$p("Observed CSV: candidate_id, observed_ccs, observed_source. Reference CSV: candidate_id, reference_ccs, reference_source. CCS supports a candidate but is not identity proof."),
+    fluidRow(column(6, fileInput("observed_ccs_csv", "Observed CCS CSV", accept = ".csv")),
+      column(6, fileInput("reference_ccs_csv", "Reference CCS CSV", accept = ".csv"))),
+    numericInput("ccs_tolerance", "CCS tolerance (%)", 2, min = 0.01, step = 0.1),
+    actionButton("run_ccs_validation", "Validate CCS evidence", class = "btn-primary"),
+    uiOutput("ccs_gate"), DTOutput("ccs_table"), uiOutput("ccs_download")),
+  tabPanel("9 Download results", tags$p("Each session writes to a unique temporary directory; source data are read-only."),
     uiOutput("download_gate"), downloadButton("download_bundle", "Download session bundle"),
     tags$details(tags$summary("Technical details — temporary session location"), textOutput("session_path")))
 )
@@ -351,7 +379,8 @@ server <- function(input, output, session) {
   state <- reactiveValues(valid = FALSE, spec = NULL, validation = NULL, processed = NULL,
     analysis_matrix = NULL, tissue_gate = NULL, tissue_mask = NULL, registration = NULL,
     domains = NULL, domain_counts = NULL, domain_features = NULL, neighbors = NULL,
-    moran = NULL, lcms = NULL, example_note = NULL)
+    corroboration = NULL, corroborated_pixels = NULL, moran = NULL, lcms = NULL,
+    feature_matches = NULL, ccs_evidence = NULL, example_note = NULL)
   session_dir <- file.path(session_root, paste0("SpatialOmicsMSI-session-", Sys.getpid(), "-", substr(session$token, 1, 8)))
   dir.create(session_dir, recursive = TRUE, showWarnings = FALSE)
   output$session_path <- renderText(session_dir)
@@ -378,7 +407,10 @@ server <- function(input, output, session) {
   reset_analysis <- function() {
     state$valid <- FALSE; state$validation <- NULL; state$processed <- NULL; state$analysis_matrix <- NULL
     state$tissue_gate <- NULL; state$tissue_mask <- NULL; state$registration <- NULL
-    state$domains <- NULL; state$neighbors <- NULL; state$moran <- NULL; state$lcms <- NULL
+    state$domains <- NULL; state$domain_counts <- NULL; state$domain_features <- NULL
+    state$corroboration <- NULL; state$corroborated_pixels <- NULL
+    state$neighbors <- NULL; state$moran <- NULL; state$lcms <- NULL
+    state$feature_matches <- NULL; state$ccs_evidence <- NULL
   }
 
   observeEvent(input$load_example, {
@@ -558,6 +590,49 @@ server <- function(input, output, session) {
   output$domain_download <- renderUI(if (!is.null(state$domains)) downloadButton("download_domains", "Download domain CSV") else NULL)
   output$download_domains <- downloadHandler(filename = function() "spatial_domains.csv", content = function(file) { req(state$domains); write.csv(state$domains, file, row.names = FALSE) })
 
+  output$corroboration_action <- renderUI({
+    if (is.null(state$domains)) return(tags$div(class = "alert alert-warning", "Load or generate spatial domains first."))
+    if (is.null(input$corroboration_csv)) return(tags$div(class = "alert alert-secondary", "Supply an independent coordinate-aligned label CSV."))
+    actionButton("run_corroboration", "Compare label maps", class = "btn-primary")
+  })
+  observeEvent(input$run_corroboration, {
+    req(state$domains, input$corroboration_csv, state$processed)
+    info <- validate_label_file(input$corroboration_csv$datapath)
+    second <- resolve_label_mapping(info, state$processed$coordinates,
+      state$spec$sample_id, state$spec$section_id)
+    label_a <- as.character(state$domains$domain_id)
+    label_b <- as.character(second$domain_id)
+    label_a[label_a == "-1"] <- NA_character_
+    label_b[label_b == "-1"] <- NA_character_
+    result <- corroborate_cluster_labels(label_a, label_b,
+      min_cooccurrence_fraction = input$corroboration_fraction,
+      min_pair_count = input$corroboration_count,
+      mapping = input$corroboration_mapping)
+    state$corroboration <- result
+    state$corroborated_pixels <- data.frame(
+      state$processed$coordinates, label_a = label_a, label_b = label_b,
+      combined_label = result$combined_label,
+      corroborated = result$corroborated, stringsAsFactors = FALSE)
+    write.csv(result$pair_summary, file.path(session_dir, "cross_modal_label_pairs.csv"), row.names = FALSE)
+    write.csv(state$corroborated_pixels, file.path(session_dir, "cross_modal_corroborated_pixels.csv"), row.names = FALSE)
+  })
+  output$corroboration_gate <- renderUI({
+    req(state$corroboration)
+    tags$div(class = "alert alert-success",
+      sprintf("Corroborated %.1f%% of pixels carrying both labels. %s",
+        100 * state$corroboration$corroboration_rate_valid_pixels,
+        state$corroboration$interpretation))
+  })
+  output$corroboration_pairs <- renderDT({ req(state$corroboration)
+    datatable(state$corroboration$pair_summary, options = list(pageLength = 10, scrollX = TRUE)) })
+  output$corroboration_plot <- renderPlot({ req(state$corroborated_pixels); d <- state$corroborated_pixels
+    ggplot(d, aes(x, y, color = combined_label)) + geom_point(size = .7) + coord_equal() +
+      scale_y_reverse() + theme_minimal() + labs(title = "Cross-modal label corroboration", color = "Joint label") })
+  output$corroboration_download <- renderUI(if (!is.null(state$corroboration))
+    downloadButton("download_corroboration", "Download corroborated pixels") else NULL)
+  output$download_corroboration <- downloadHandler(filename = function() "cross_modal_corroborated_pixels.csv",
+    content = function(file) { req(state$corroborated_pixels); write.csv(state$corroborated_pixels, file, row.names = FALSE) })
+
   output$moran_action <- renderUI({
     if (!isTRUE(state$valid) || !isTRUE(state$validation$capabilities$moran)) return(tags$div(class = "alert alert-secondary", "Moran's I is disabled until MSI input is validated."))
     if (is.null(state$processed)) return(tags$div(class = "alert alert-warning", "Process MSI first."))
@@ -604,6 +679,43 @@ server <- function(input, output, session) {
   output$fragment_plot <- renderPlot({ req(state$lcms); d <- state$lcms$fragment_peak_table
     validate(need(nrow(d) > 0, "No target-precursor MS2 scan was found in this file."))
     ggplot(d, aes(fragment_mz, fragment_intensity)) + geom_segment(aes(xend = fragment_mz, yend = 0)) + facet_wrap(~scan_id, scales = "free_y") + theme_minimal() + labs(title = "Unassigned fragment spectrum", x = "fragment m/z", y = "intensity") })
+
+  observeEvent(input$run_feature_matching, {
+    req(input$msi_feature_csv, input$lcms_feature_csv)
+    msi <- read.csv(input$msi_feature_csv$datapath, check.names = FALSE, stringsAsFactors = FALSE)
+    lcms <- read.csv(input$lcms_feature_csv$datapath, check.names = FALSE, stringsAsFactors = FALSE)
+    require_columns(msi, "mz", "MSI feature CSV")
+    require_columns(lcms, "mz", "LC-MS feature CSV")
+    state$feature_matches <- cross_validate_msi_lcms(msi, lcms, ppm = input$feature_match_ppm,
+      assignment_method = input$assignment_method)
+    write.csv(state$feature_matches, file.path(session_dir, "msi_lcms_feature_matches.csv"), row.names = FALSE)
+    summary <- attr(state$feature_matches, "summary")
+    if (!is.null(summary)) write.csv(summary, file.path(session_dir, "msi_lcms_feature_match_summary.csv"), row.names = FALSE)
+  })
+  output$feature_match_gate <- renderUI({ req(state$feature_matches); summary <- attr(state$feature_matches, "summary")
+    tags$div(class = "alert alert-success", sprintf("Matched %d of %d MSI features using %s one-to-one assignment.",
+      summary$matched_features, summary$total_msi_features, summary$assignment_method)) })
+  output$feature_match_table <- renderDT({ req(state$feature_matches)
+    datatable(state$feature_matches, options = list(pageLength = 10, scrollX = TRUE)) })
+  output$feature_match_download <- renderUI(if (!is.null(state$feature_matches))
+    downloadButton("download_feature_matches", "Download feature matches") else NULL)
+  output$download_feature_matches <- downloadHandler(filename = function() "msi_lcms_feature_matches.csv",
+    content = function(file) { req(state$feature_matches); write.csv(state$feature_matches, file, row.names = FALSE) })
+
+  observeEvent(input$run_ccs_validation, {
+    req(input$observed_ccs_csv, input$reference_ccs_csv)
+    observed <- read.csv(input$observed_ccs_csv$datapath, check.names = FALSE, stringsAsFactors = FALSE)
+    reference <- read.csv(input$reference_ccs_csv$datapath, check.names = FALSE, stringsAsFactors = FALSE)
+    state$ccs_evidence <- validate_ccs_evidence(observed, reference, ccs_tolerance_pct = input$ccs_tolerance)
+    write.csv(state$ccs_evidence, file.path(session_dir, "ccs_evidence.csv"), row.names = FALSE)
+  })
+  output$ccs_gate <- renderUI(if (!is.null(state$ccs_evidence)) tags$div(class = "alert alert-success",
+    "CCS evidence was evaluated. Measured-library and predicted references remain explicitly distinguished in the output.") else NULL)
+  output$ccs_table <- renderDT({ req(state$ccs_evidence)
+    datatable(state$ccs_evidence, options = list(pageLength = 10, scrollX = TRUE)) })
+  output$ccs_download <- renderUI(if (!is.null(state$ccs_evidence)) downloadButton("download_ccs", "Download CCS evidence") else NULL)
+  output$download_ccs <- downloadHandler(filename = function() "ccs_evidence.csv",
+    content = function(file) { req(state$ccs_evidence); write.csv(state$ccs_evidence, file, row.names = FALSE) })
 
   output$download_gate <- renderUI(if (!isTRUE(state$valid)) tags$div(class = "alert alert-warning", "Validate an analysis before downloading results.") else NULL)
   output$download_bundle <- downloadHandler(filename = function() paste0("SpatialOmicsMSI-session-", Sys.Date(), ".zip"), content = function(file) {

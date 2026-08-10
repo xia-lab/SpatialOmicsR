@@ -14,7 +14,9 @@ text <- paste(readLines(app_path, warn = FALSE), collapse = "\n")
 stopifnot(all(vapply(c("Start a new analysis", "Load an example dataset", "Example datasets",
   "Paired imzML + ibd", "Processed pixel × feature CSV", "Biological subject ID",
   "Optional optical/H&E/brightfield JPEG", "Optional ROI/domain CSV", "Optional LC-MS/MS mzML",
-  "Continue to Processing", "Technical details", "Pseudoreplication warning"),
+  "Continue to Processing", "Technical details", "Pseudoreplication warning",
+  "Cross-modal ROI validation", "MSI–LC-MS feature-table matching",
+  "Optimal (recommended)", "CCS / ion-mobility evidence"),
   grepl, logical(1), x = text, fixed = TRUE)))
 stopifnot(!grepl("Registration is available for Brain01 only", text, fixed = TRUE))
 stopifnot(!grepl("Select the MSV000090179 preset first", text, fixed = TRUE))
@@ -99,6 +101,32 @@ shiny::testServer(env$server, {
   session$setInputs(run_processing = 1); session$flushReact()
   stopifnot(nrow(state$processed$pixel_feature_matrix) == 4L,
             ncol(state$analysis_matrix) == 2L, all(state$tissue_mask))
+
+  msi_features <- tempfile(fileext = ".csv")
+  lcms_features <- tempfile(fileext = ".csv")
+  write.csv(data.frame(feature_id = c("m1", "m2"), mz = c(100, 200),
+    ion_mode = "positive", log2fc = c(1, -1)), msi_features, row.names = FALSE)
+  write.csv(data.frame(feature_id = c("l1", "l2"), mz = c(100.0002, 200.0003),
+    ion_mode = "positive", log2fc = c(2, -2)), lcms_features, row.names = FALSE)
+  session$setInputs(msi_feature_csv = list(datapath = msi_features),
+    lcms_feature_csv = list(datapath = lcms_features), feature_match_ppm = 5,
+    assignment_method = "optimal", run_feature_matching = 1)
+  session$flushReact()
+  stopifnot(nrow(state$feature_matches) == 2L,
+    all(state$feature_matches$assignment_method == "optimal"),
+    all(state$feature_matches$direction_agreement))
+
+  observed_ccs <- tempfile(fileext = ".csv")
+  reference_ccs <- tempfile(fileext = ".csv")
+  write.csv(data.frame(candidate_id = "c1", observed_ccs = 150,
+    observed_source = "lcms_empirical"), observed_ccs, row.names = FALSE)
+  write.csv(data.frame(candidate_id = "c1", reference_ccs = 151,
+    reference_source = "measured_library"), reference_ccs, row.names = FALSE)
+  session$setInputs(observed_ccs_csv = list(datapath = observed_ccs),
+    reference_ccs_csv = list(datapath = reference_ccs), ccs_tolerance = 2,
+    run_ccs_validation = 1)
+  session$flushReact()
+  stopifnot(nrow(state$ccs_evidence) == 1L)
   session$setInputs(entry = "example", example_key = "brain01", load_example = 1)
   session$flushReact()
   stopifnot(input$entry == "example")
