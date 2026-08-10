@@ -17,7 +17,8 @@ accurate-mass matches are not reported as confirmed molecular structures.
 - Rook, Queen and distance-threshold spatial graphs.
 - Moran's I, Geary's C and binSpect-inspired spatial variability analysis.
 - PCA/k-means, BANKSY-inspired H0 clustering and ICM/Potts HMRF clustering.
-- Automatic, coordinate, polygon and histology-guided ROI workflows.
+- Fixed-window and connected-domain automatic ROI selection, target-enrichment
+  scoring, multipart/hole-aware manual polygons and QuPath GeoJSON import.
 - Histology-to-MSI affine registration and METASPACE optical transforms.
 - Cell-label preparation from external labels, NNLS/cosine transfer or
   exploratory watershed morphology classes.
@@ -26,7 +27,10 @@ accurate-mass matches are not reported as confirmed molecular structures.
 - Expression-only and spatial ligand-receptor communication-potential analyses.
 - Signed distance-to-domain rings and descriptive or subject-level GAMs.
 - Subject-level t-test/Wilcoxon analysis and Gaussian spatial mixed models.
-- Annotation, LC-MS and MS/MS evidence integration.
+- Auditable all-candidate and global-optimal MSI/LC-MS matching, MS/MS and
+  explicitly scoped CCS evidence integration.
+- Vendor-neutral LCM ROI boundaries, registered target coordinates and
+  ROI-level MSI--LCM quantitative concordance.
 - MetaboAnalyst export/import, ORA/mummichog scripts and spatial back-mapping.
 - A bundled Shiny application and provenance-aware output manifests.
 
@@ -53,11 +57,11 @@ BiocManager::install(c("Cardinal", "EBImage"))
 For a future GitHub repository, installation will be:
 
 ```r
-remotes::install_github("OWNER/SpatialOmicsMSI", dependencies = TRUE)
+remotes::install_github("xia-lab/SpatialOmicsR", dependencies = TRUE)
 ```
 
-Replace `OWNER` after the repository has been created; no Git remote is
-currently configured in this working copy.
+The GitHub repository is named `SpatialOmicsR`; the installed R package and
+library name remain `SpatialOmicsMSI` for compatibility.
 
 ## Minimal CSV workflow
 
@@ -172,4 +176,9 @@ the selected modules implement or approximate.
 - Ligand-receptor results indicate expression/proximity-supported communication
   potential, not receptor activation or causal signaling.
 - Metabolite identities require evidence beyond accurate mass and pathway hits.
+- LC-MS-only CCS cannot confirm an MSI identity when MSI lacks an ion-mobility
+  measurement. Vendor-neutral LCM coordinates require instrument-side
+  calibration and validation before physical cutting.
+- LMD geometry QC is read-only; the package does not silently split, buffer or
+  simplify biological ROIs into manufacturer-specific cutting commands.
 - Population claims require independent biological subjects.

@@ -81,6 +81,12 @@ registration functions preserve coordinate and section provenance. Statistical
 functions distinguish exploratory pixel-level summaries from analyses that use
 biological subjects as the inference unit.
 
+The \code{cluster_column} accepted by ROI functions is a generic pixel-level
+classification column. It may originate from histology clustering, MSI
+chemical-domain clustering, or explicitly reported cross-modal label
+agreement; these sources are not interchangeable biological identities and
+their provenance must accompany ROI results.
+
 Individual function signatures are discoverable with \code{args()} and are
 demonstrated in the package README and workflow vignette. Specialized methods
 with additional scientific assumptions have dedicated help pages.

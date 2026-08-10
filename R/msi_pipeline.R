@@ -4607,6 +4607,169 @@ compare_svg_methods <- function(moran_result,
   output
 }
 
+find_msi_lcms_candidates <- function(msi_features,
+                                     lcms_features,
+                                     msi_mz_col = "mz",
+                                     lcms_mz_col = "mz",
+                                     msi_mode_col = "ion_mode",
+                                     lcms_mode_col = "ion_mode",
+                                     ppm = 5) {
+  if (!is.data.frame(msi_features) || !is.data.frame(lcms_features)) {
+    stop("Both MSI features and LC-MS features must be data frames.", call. = FALSE)
+  }
+  if (!is.numeric(ppm) || length(ppm) != 1L || !is.finite(ppm) || ppm < 0) {
+    stop("ppm must be one finite non-negative number.", call. = FALSE)
+  }
+  msi_mz_col <- first_existing_column(msi_features, msi_mz_col, "MSI m/z column")
+  lcms_mz_col <- first_existing_column(lcms_features, lcms_mz_col, "LC-MS m/z column")
+  msi_mz <- suppressWarnings(as.numeric(msi_features[[msi_mz_col]]))
+  lcms_mz <- suppressWarnings(as.numeric(lcms_features[[lcms_mz_col]]))
+  if (any(!is.finite(msi_mz) | msi_mz <= 0)) {
+    stop("MSI m/z values must be numeric, finite, and positive.", call. = FALSE)
+  }
+  if (any(!is.finite(lcms_mz) | lcms_mz <= 0)) {
+    stop("LC-MS m/z values must be numeric, finite, and positive.", call. = FALSE)
+  }
+
+  choose_optional <- function(data, candidates) {
+    columns <- candidates[candidates %in% names(data)]
+    if (length(columns)) columns[1L] else NULL
+  }
+  msi_mode_col <- choose_optional(msi_features, msi_mode_col)
+  lcms_mode_col <- choose_optional(lcms_features, lcms_mode_col)
+  mode_match <- !is.null(msi_mode_col) && !is.null(lcms_mode_col)
+  tolerance <- ppm + .Machine$double.eps * 1e6
+  rows <- lapply(seq_along(msi_mz), function(i) {
+    candidate_index <- seq_along(lcms_mz)
+    if (mode_match) {
+      msi_mode <- as.character(msi_features[[msi_mode_col]][i])
+      lcms_mode <- as.character(lcms_features[[lcms_mode_col]])
+      candidate_index <- candidate_index[!is.na(msi_mode) & !is.na(lcms_mode) & lcms_mode == msi_mode]
+    }
+    if (!length(candidate_index)) return(NULL)
+    error <- abs(lcms_mz[candidate_index] - msi_mz[i]) / msi_mz[i] * 1e6
+    keep <- is.finite(error) & error <= tolerance
+    if (!any(keep)) return(NULL)
+    candidate_index <- candidate_index[keep]
+    error <- error[keep]
+    order_index <- order(error, candidate_index)
+    data.frame(
+      msi_row = i,
+      lcms_row = candidate_index[order_index],
+      msi_feature_id = if ("feature_id" %in% names(msi_features)) as.character(msi_features$feature_id[i]) else as.character(i),
+      lcms_feature_id = as.character(candidate_index[order_index]),
+      msi_mz = msi_mz[i],
+      lcms_mz = lcms_mz[candidate_index[order_index]],
+      ion_mode = if (mode_match) as.character(msi_features[[msi_mode_col]][i]) else NA_character_,
+      ppm_error = error[order_index],
+      candidate_rank = seq_along(order_index),
+      stringsAsFactors = FALSE
+    )
+  })
+  rows <- Filter(Negate(is.null), rows)
+  if (!length(rows)) return(data.frame(
+    msi_row = integer(), lcms_row = integer(), msi_feature_id = character(),
+    lcms_feature_id = character(), msi_mz = numeric(), lcms_mz = numeric(),
+    ion_mode = character(), ppm_error = numeric(), candidate_rank = integer(),
+    candidate_count = integer(), stringsAsFactors = FALSE
+  ))
+  result <- do.call(rbind, rows)
+  counts <- table(result$msi_row)
+  result$candidate_count <- as.integer(counts[as.character(result$msi_row)])
+  rownames(result) <- NULL
+  result
+}
+
+assign_msi_lcms_candidates <- function(candidates,
+                                       n_msi,
+                                       n_lcms,
+                                       ppm,
+                                       method = c("greedy", "optimal")) {
+  method <- match.arg(method)
+  if (!is.data.frame(candidates) ||
+      !all(c("msi_row", "lcms_row", "ppm_error") %in% names(candidates))) {
+    stop("candidates must come from find_msi_lcms_candidates().", call. = FALSE)
+  }
+  if (!nrow(candidates)) return(integer())
+  if (method == "greedy") {
+    used_lcms <- rep(FALSE, n_lcms)
+    selected <- integer()
+    for (i in seq_len(n_msi)) {
+      available <- which(candidates$msi_row == i & !used_lcms[candidates$lcms_row])
+      if (!length(available)) next
+      chosen <- available[which.min(candidates$ppm_error[available])]
+      selected <- c(selected, chosen)
+      used_lcms[candidates$lcms_row[chosen]] <- TRUE
+    }
+    return(selected)
+  }
+  # Every MSI row receives either a unique real LC-MS column or one of n_msi
+  # rejection columns.  The rejection penalty is larger than the maximum
+  # possible change in total feasible ppm cost, so the solution first
+  # maximizes match cardinality and then minimizes total ppm error.
+  rejection_penalty <- (n_msi + 1) * (ppm + 1)
+  infeasible_penalty <- (n_msi + 1) * rejection_penalty
+  cost <- matrix(infeasible_penalty, nrow = n_msi, ncol = n_lcms + n_msi)
+  cost[, n_lcms + seq_len(n_msi)] <- rejection_penalty
+  cost[cbind(candidates$msi_row, candidates$lcms_row)] <- candidates$ppm_error
+  # Rectangular Hungarian algorithm. Keeping this small implementation in base
+  # R avoids making scientifically important matching depend on an optional
+  # package. The matrix always has at least as many columns as rows.
+  solve_rectangular_lsap <- function(x) {
+    nr <- nrow(x); nc <- ncol(x)
+    if (nr > nc || any(!is.finite(x)) || any(x < 0)) {
+      stop("Internal assignment costs must be finite, non-negative, and rectangular.", call. = FALSE)
+    }
+    u <- numeric(nr)
+    v <- numeric(nc + 1L)
+    p <- integer(nc + 1L)
+    way <- integer(nc + 1L)
+    for (i in seq_len(nr)) {
+      p[1L] <- i
+      j0 <- 1L
+      minv <- rep(Inf, nc)
+      used <- rep(FALSE, nc + 1L)
+      repeat {
+        used[j0] <- TRUE
+        i0 <- p[j0]
+        columns <- which(!used[-1L])
+        current <- x[i0, columns] - u[i0] - v[columns + 1L]
+        improve <- current < minv[columns]
+        if (any(improve)) {
+          improved_columns <- columns[improve]
+          minv[improved_columns] <- current[improve]
+          way[improved_columns + 1L] <- j0
+        }
+        delta <- min(minv[columns])
+        j1_column <- columns[which.min(minv[columns])]
+        used_indices <- which(used)
+        real_rows <- p[used_indices]
+        real <- real_rows > 0L
+        u[real_rows[real]] <- u[real_rows[real]] + delta
+        v[used_indices] <- v[used_indices] - delta
+        minv[columns] <- minv[columns] - delta
+        j0 <- j1_column + 1L
+        if (p[j0] == 0L) break
+      }
+      repeat {
+        j1 <- way[j0]
+        p[j0] <- p[j1]
+        j0 <- j1
+        if (j0 == 1L) break
+      }
+    }
+    assignment <- integer(nr)
+    for (j in 2:(nc + 1L)) if (p[j] > 0L) assignment[p[j]] <- j - 1L
+    assignment
+  }
+  assignment <- solve_rectangular_lsap(cost)
+  real_rows <- which(assignment <= n_lcms)
+  if (!length(real_rows)) return(integer())
+  keys <- paste(candidates$msi_row, candidates$lcms_row, sep = ":")
+  selected <- match(paste(real_rows, assignment[real_rows], sep = ":"), keys)
+  selected[!is.na(selected)]
+}
+
 cross_validate_msi_lcms <- function(msi_features,
                                     lcms_features,
                                     msi_mz_col = "mz",
@@ -4618,7 +4781,9 @@ cross_validate_msi_lcms <- function(msi_features,
                                     lcms_id_col = c("id", "compound_id", "feature_id", "name"),
                                     lcms_name_col = c("name", "compound", "compound_name"),
                                     lcms_rt_col = c("rt", "retention_time"),
-                                    ppm = 5) {
+                                    ppm = 5,
+                                    assignment_method = c("greedy", "optimal")) {
+  assignment_method <- match.arg(assignment_method)
   if (!is.data.frame(msi_features) || !is.data.frame(lcms_features)) {
     stop("Both MSI features and LC-MS features must be data frames.", call. = FALSE)
   }
@@ -4651,25 +4816,18 @@ cross_validate_msi_lcms <- function(msi_features,
   }
 
   mode_match <- !is.null(msi_mode_col) && !is.null(lcms_mode_col)
-  used_lcms <- rep(FALSE, nrow(lcms_features))
-  rows <- list()
-
-  for (i in seq_len(nrow(msi_features))) {
-    mz <- msi_mz[i]
-    candidate_idx <- which(!used_lcms)
-    if (mode_match) {
-      candidate_idx <- candidate_idx[lcms_features[[lcms_mode_col]][candidate_idx] == msi_features[[msi_mode_col]][i]]
-    }
-    if (length(candidate_idx) == 0) next
-
-    ppm_error <- abs(lcms_mz[candidate_idx] - mz) / mz * 1e6
-    # Allow a tiny numerical tolerance to account for floating-point rounding
-    # when comparing ppm errors to the threshold.
-    within <- which(ppm_error <= (ppm + (.Machine$double.eps * 1e6)))
-    if (length(within) == 0) next
-
-    chosen <- candidate_idx[within[which.min(ppm_error[within])]]
-    used_lcms[chosen] <- TRUE
+  candidates <- find_msi_lcms_candidates(
+    msi_features, lcms_features, msi_mz_col, lcms_mz_col,
+    msi_mode_col, lcms_mode_col, ppm
+  )
+  selected <- assign_msi_lcms_candidates(
+    candidates, nrow(msi_features), nrow(lcms_features), ppm,
+    method = assignment_method
+  )
+  rows <- lapply(selected, function(candidate_row) {
+    candidate <- candidates[candidate_row, , drop = FALSE]
+    i <- candidate$msi_row
+    chosen <- candidate$lcms_row
 
     msi_log2fc <- if (!is.null(msi_log2fc_col)) suppressWarnings(as.numeric(msi_features[[msi_log2fc_col]][i])) else NA_real_
     lcms_log2fc <- if (!is.null(lcms_log2fc_col)) suppressWarnings(as.numeric(lcms_features[[lcms_log2fc_col]][chosen])) else NA_real_
@@ -4683,23 +4841,25 @@ cross_validate_msi_lcms <- function(msi_features,
     match_type <- "feature_level_orthogonal_support"
     lcms_rt <- if (!is.null(lcms_rt_col)) lcms_features[[lcms_rt_col]][chosen] else NA_real_
 
-    rows[[length(rows) + 1L]] <- data.frame(
+    data.frame(
       msi_feature_id = if ("feature_id" %in% names(msi_features)) as.character(msi_features$feature_id[i]) else NA_character_,
-      msi_mz = mz,
+      msi_mz = msi_mz[i],
       lcms_feature_id = if (!is.null(lcms_id_col)) as.character(lcms_features[[lcms_id_col]][chosen]) else NA_character_,
       lcms_mz = lcms_mz[chosen],
       ion_mode = if (mode_match) as.character(msi_features[[msi_mode_col]][i]) else NA_character_,
-      ppm_error = ppm_error[within[which.min(ppm_error[within])]],
+      ppm_error = candidate$ppm_error,
       msi_log2fc = msi_log2fc,
       lcms_log2fc = lcms_log2fc,
       direction_agreement = direction_agreement,
       match_type = match_type,
       lcms_rt = if (!is.null(lcms_rt_col)) lcms_rt else NA_real_,
       lcms_name = lcms_name,
+      candidate_count = candidate$candidate_count,
+      assignment_method = assignment_method,
       stringsAsFactors = FALSE,
       check.names = FALSE
     )
-  }
+  })
 
   result <- if (length(rows) > 0) do.call(rbind, rows) else structure(data.frame(
     msi_feature_id = character(),
@@ -4714,6 +4874,8 @@ cross_validate_msi_lcms <- function(msi_features,
     match_type = character(),
     lcms_rt = numeric(),
     lcms_name = character(),
+    candidate_count = integer(),
+    assignment_method = character(),
     stringsAsFactors = FALSE,
     check.names = FALSE
   ), class = "data.frame")
@@ -4721,6 +4883,8 @@ cross_validate_msi_lcms <- function(msi_features,
   summary <- data.frame(
     total_msi_features = nrow(msi_features),
     matched_features = nrow(result),
+    ambiguous_msi_features = sum(result$candidate_count > 1L, na.rm = TRUE),
+    assignment_method = assignment_method,
     feature_level_supported_matches = sum(result$match_type == "feature_level_orthogonal_support", na.rm = TRUE),
     agreement_rate = if (sum(!is.na(result$direction_agreement)) == 0) NA_real_ else mean(result$direction_agreement, na.rm = TRUE),
     stringsAsFactors = FALSE
