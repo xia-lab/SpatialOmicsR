@@ -21,4 +21,5 @@
 ^\.codex(?:/|$)
 ^SpatialOmicsMSI_.*\.tar\.gz$
 ^outputs(?:/|$)
+^vignettes(?:/|$)
 ^spatial_omics_source_.*\.zip$

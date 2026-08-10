@@ -27,6 +27,7 @@ data_processed/
 results/
 figures/
 outputs/
+vignettes/
 spatial_omics_source_*.zip
 
 # Temporary files

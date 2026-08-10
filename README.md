@@ -34,8 +34,8 @@ accurate-mass matches are not reported as confirmed molecular structures.
 - MetaboAnalyst export/import, ORA/mummichog scripts and spatial back-mapping.
 - A bundled Shiny application and provenance-aware output manifests.
 
-See the [workflow vignette](vignettes/spatial_metabolomics_workflow.Rmd) for the
-scientific workflow and interpretation boundaries.
+Scientific interpretation boundaries are documented in the function help
+pages and module-specific output metadata.
 
 ## Installation
 
@@ -162,14 +162,13 @@ R/          Package functions
 man/        User-facing function documentation
 tests/      Regression and scientific-boundary tests
 scripts/    Reproducible analysis entry points
-vignettes/  End-to-end workflow and interpretation guidance
 inst/       Shiny application and data-installation instructions
 ```
 
 ## Citation and license
 
 The software is released under the MIT license. Method-specific references are
-provided in the corresponding help pages and vignette. If this package is used
+provided in the corresponding help pages. If this package is used
 in a publication, cite both the package version and the original methods that
 the selected modules implement or approximate.
 
