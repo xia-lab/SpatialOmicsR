@@ -1,9 +1,7 @@
 # MetaboAnalystR PCA integration test
 #
-# R console usage:
-# setwd("/Users/ly/Documents/Spatial Omics")
-# Sys.setenv(SPATIALOMICS_RAT_BRAIN_DIR = "/Users/ly/Desktop/Jeff Xia/rat_brain_data")
-# source("scripts/test_metaboanalystR_pca.R")
+# Run from the repository root after setting SPATIALOMICS_RAT_BRAIN_DIR.
+source("scripts/_bootstrap.R")
 
 required_pkgs <- c("MetaboAnalystR", "RSclient", "factoextra")
 missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
@@ -43,13 +41,11 @@ run_local_pca <- function(mSet) {
   mSet
 }
 
-if (file.exists("R/msi_pipeline.R")) {
-  source("R/msi_pipeline.R")
-} else {
-  library(SpatialOmicsMSI)
-}
+load_spatialomics_code()
 
-data_dir <- Sys.getenv("SPATIALOMICS_RAT_BRAIN_DIR", unset = file.path("data", "rat_brain_data"))
+data_dir <- spatialomics_data_dir(
+  "SPATIALOMICS_RAT_BRAIN_DIR", "data_raw/rat_brain_data", "Rat-brain data"
+)
 out_dir <- file.path(data_dir, "spatial_test_outputs")
 plot_dir <- file.path(out_dir, "plots")
 ma_dir <- file.path(out_dir, "metaboanalystR_test")

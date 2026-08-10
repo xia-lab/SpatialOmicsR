@@ -1,7 +1,10 @@
-source("R/msi_pipeline.R")
+source("scripts/_bootstrap.R")
+load_spatialomics_code()
 
-data_root <- Sys.getenv("SPATIALOMICS_ITO1_DIR", unset = file.path("data", "ITO1"))
-output_dir <- "outputs/sma_ito1_validation"
+data_root <- spatialomics_data_dir(
+  "SPATIALOMICS_ITO1_DIR", "data_raw/ITO1", "ITO1 data"
+)
+output_dir <- spatialomics_path("outputs", "sma_ito1_validation")
 
 paths <- list.files(
   data_root,

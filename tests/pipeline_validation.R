@@ -246,6 +246,66 @@ stopifnot(is.finite(region_diff$p_value[region_diff$feature == "mz_100"]))
 stopifnot(all(region_diff$inference_unit == "biological_subject"))
 stopifnot(!any(region_diff$pseudoreplication_warning))
 
+# Wilcoxon analysis fixes pairing at the contrast level and reports rank-based QC.
+wilcoxon_samples <- expand.grid(
+  subject_id = paste0("subject_", 1:6),
+  roi_id = c("cortex", "medulla"),
+  tile = 1:2,
+  stringsAsFactors = FALSE
+)
+wilcoxon_samples$sample_id <- paste(
+  wilcoxon_samples$subject_id, wilcoxon_samples$roi_id, wilcoxon_samples$tile, sep = "_"
+)
+subject_effect <- rep(seq_len(6), each = 2L, times = 2L)
+wilcoxon_samples$mz_100 <- ifelse(wilcoxon_samples$roi_id == "medulla", 10, 1) +
+  subject_effect * 0.01 + wilcoxon_samples$tile * 0.001
+wilcoxon_samples$mz_200 <- rep(c(1, 2, 2, 3), length.out = nrow(wilcoxon_samples))
+wilcoxon_diff <- differential_region_analysis_wilcoxon(
+  wilcoxon_samples,
+  group_column = "roi_id",
+  subject_column = "subject_id",
+  reference_group = "cortex",
+  min_replicates = 5
+)
+stopifnot(all(c(
+  "median_difference", "hodges_lehmann_shift", "rank_biserial_correlation",
+  "p_value_method", "status", "n_ties", "fdr_scope"
+) %in% names(wilcoxon_diff)))
+wilcoxon_signal <- wilcoxon_diff[wilcoxon_diff$feature == "mz_100", ]
+stopifnot(wilcoxon_signal$status == "fitted")
+stopifnot(wilcoxon_signal$n_pairs == 6L)
+stopifnot(wilcoxon_signal$n_shared_replicates_design == 6L)
+stopifnot(wilcoxon_signal$median_difference > 0)
+stopifnot(wilcoxon_signal$rank_biserial_correlation > 0)
+stopifnot(is.finite(wilcoxon_signal$p_value))
+stopifnot(identical(wilcoxon_signal$fdr_scope, "within_contrast_across_features"))
+
+# Missing feature values may reduce complete pairs, but must never switch the design to unpaired.
+wilcoxon_missing <- wilcoxon_samples
+wilcoxon_missing$mz_100[
+  wilcoxon_missing$subject_id %in% c("subject_1", "subject_2") &
+    wilcoxon_missing$roi_id == "medulla"
+] <- NA_real_
+wilcoxon_missing_result <- differential_region_analysis_wilcoxon(
+  wilcoxon_missing,
+  group_column = "roi_id",
+  subject_column = "subject_id",
+  min_replicates = 5
+)
+missing_signal <- wilcoxon_missing_result[wilcoxon_missing_result$feature == "mz_100", ]
+stopifnot(missing_signal$test_type == "paired_wilcoxon_signed_rank")
+stopifnot(missing_signal$status == "skipped")
+stopifnot(missing_signal$skip_reason == "feature_missingness_reduces_replication")
+
+bad_reference_error <- tryCatch(
+  differential_region_analysis_wilcoxon(
+    wilcoxon_samples, group_column = "roi_id", subject_column = "subject_id",
+    reference_group = "absent"
+  ),
+  error = function(e) conditionMessage(e)
+)
+stopifnot(grepl("reference_group is not present", bad_reference_error, fixed = TRUE))
+
 pseudorep_warning <- NULL
 exploratory_diff <- withCallingHandlers(
   differential_region_analysis(region_samples, group_column = "roi_id", section_column = "section_id"),

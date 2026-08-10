@@ -3,9 +3,8 @@
 # Path A: high-confidence SwissLipids annotations with CHEBI IDs.
 # Path B: all remaining features for mummichog/PSEA using m/z + statistics.
 #
-# R console usage:
-# setwd("/Users/ly/Documents/Spatial Omics")
-# source("scripts/prepare_pathway_split_inputs.R")
+# Run from the repository root after setting the data environment variables.
+source("scripts/_bootstrap.R")
 
 split_ids <- function(x) {
   x <- paste(na.omit(x), collapse = "; ")
@@ -20,10 +19,15 @@ best_signed_stat <- function(x) {
 }
 
 if (!exists("data_dir", inherits = TRUE)) {
-  data_dir <- "/Users/ly/Desktop/Jeff Xia/rat_brain_data"
+  data_dir <- spatialomics_data_dir(
+    "SPATIALOMICS_RAT_BRAIN_DIR", "data_raw/rat_brain_data", "Rat-brain data"
+  )
 }
 if (!exists("swisslipids_master_tsv", inherits = TRUE)) {
-  swisslipids_master_tsv <- "/Users/ly/Downloads/lipids.tsv"
+  swisslipids_master_tsv <- Sys.getenv(
+    "SPATIALOMICS_SWISSLIPIDS_TSV",
+    unset = file.path(data_dir, "swisslipids_master.tsv")
+  )
 }
 if (!exists("pathway_out_dir", inherits = TRUE)) {
   pathway_out_dir <- file.path(data_dir, "pathway_inputs")

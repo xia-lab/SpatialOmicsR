@@ -137,8 +137,11 @@ expect_error(
   "Domain labels are not one-to-one"
 )
 
-# Local real-data contract test; skipped in source-package checks where data_raw is excluded.
-if (!is.null(project_root)) {
+# Local real-data contract test is explicitly opt-in and never runs in routine CI.
+run_real_data_tests <- identical(
+  tolower(Sys.getenv("SPATIALOMICS_RUN_REAL_DATA_TESTS", unset = "false")), "true"
+)
+if (!is.null(project_root) && run_real_data_tests && requireNamespace("Cardinal", quietly = TRUE)) {
   real_root <- file.path(project_root, "data_raw", "msiflow", "ly6g_heterogeneity_signatures")
   real_imzml <- file.path(real_root, "msi", "UPEC_12.imzML")
   if (file.exists(real_imzml)) {

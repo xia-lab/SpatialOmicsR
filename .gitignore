@@ -1,6 +1,35 @@
+# R session and package artifacts
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+*.tar.gz
+*.Rcheck/
+..Rcheck/
 .lib/
+
+# IDE and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local secrets and environment overrides
+.Renviron
+.env
+.env.*
+!.env.example
+
+# Large/raw inputs and generated analysis products
 data_raw/
 data_processed/
 results/
 figures/
-spatial_omics_source_2026-08-04.zip
+outputs/
+spatial_omics_source_*.zip
+
+# Temporary files
+*.log
+*.tmp
+~*

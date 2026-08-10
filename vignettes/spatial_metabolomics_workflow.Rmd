@@ -1,341 +1,334 @@
 ---
-title: "Reproducible Spatial Metabolomics: msiFlow Mouse Bladder"
+title: "Reproducible Spatial Metabolomics: Three Independent Mouse-Brain Datasets"
 author: ""
-output: rmarkdown::html_vignette
+output:
+  rmarkdown::html_vignette:
+    self_contained: true
+    toc: true
 vignette: >
-  %\VignetteIndexEntry{Reproducible Spatial Metabolomics: msiFlow Mouse Bladder}
+  %\VignetteIndexEntry{Reproducible Spatial Metabolomics: Three Independent Mouse-Brain Datasets}
   %\VignetteEngine{knitr::rmarkdown}
   %\VignetteEncoding{UTF-8}
 ---
 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE,
+                      fig.align="center", out.width="95%")
+```
+
 # Introduction
 
-This vignette documents the real-data workflow used for the msiFlow mouse-bladder
-dataset associated with Zenodo record
-[14184882](https://doi.org/10.5281/zenodo.14184882) and LC-MS/MS accession
-[MSV000096465](https://massive.ucsd.edu/ProteoSAFe/dataset.jsp?accession=MSV000096465).
-It separates MSI measurement, data-driven spatial characterization, accurate-mass
-annotation, and fragment-level orthogonal support.
+**Three independent mouse-brain datasets validate complementary workflow
+components.** They are not a matched cohort, same-sample cross-validation, or one
+joint biological experiment.
 
-The MSI example consists of four infected-bladder samples, UPEC_12--UPEC_15.
-The article describes four infected samples from female mice, so the subject-level
-analysis uses `subject_id = sample_id` and `section_id = sample_id`. The exact animal
-identifier is not embedded in the imzML metadata; all subject-level results therefore
-remain exploratory at (n=4). Pixels and tiles are never treated as biological
-replicates.
+| Independent dataset | Material | Workflow component |
+|---|---|---|
+| METASPACE `2016-09-22_11h16m17s` | Mouse-brain MSI plus platform optical brightfield | Variable-m/z peak alignment and optical-to-MSI registration |
+| OMIX016317 `mbrain1_neg100` | Complete mouse-brain MSI section | Profile processing, whole-section QC, ion visualization, spatial graph analysis |
+| MassIVE MSV000090179 | Female mouse-brain LC-MS/MS, 12-week replicate 1 | Precursor matching and unassigned fragment-spectrum inspection |
 
-Important provenance limits are fixed before analysis:
-
-- The supplied imzML files already contain 252 centroided, shared-axis MSI features.
-  Loading them does **not** mean this package performed raw profile peak picking,
-  alignment, or de-isotoping.
-- Positive polarity is passed explicitly with
-  `ion_mode_source = "inferred_from_annotation_adducts"`. It was not established
-  from polarity CV metadata in these imzML files.
-- Domains 0--2 are data-driven metabolic domains derived from the same MSI data.
-  Comparing them is exploratory characterization and has circularity risk.
-- Domain -1 means unclassified/background. It is retained for maps and QC but
-  excluded from formal domain comparisons.
-- This downloaded subset has no H&E image. The source study uses IFM on consecutive
-  sections; this workflow must not be described as H&E validation.
-- LC-MS/MS is a companion orthogonal dataset, not pixel-matched or demonstrably
-  paired to the individual MSI section. Fragment evidence supports compatibility
-  with a paper-reported assignment, not MSI--LC-MS quantitative correlation.
+The METASPACE image is called **optical brightfield**, not H&E. Its CC BY 4.0
+attribution is LAVIGNE Régis, Université de Rennes 1. MSV000090179 is CC0. Large
+raw files remain outside the installed package.
 
 # Data Processing
 
-The reproducible processing contract is strictly:
+The processing contract contains exactly five steps.
+
+## Step 1: Input validation and provenance
+
+Each imzML is checked against its ibd UUID and external-array bounds before
+Cardinal reads it. Sample, section, polarity and the source of the polarity claim
+are explicit. Dataset 1 contains 17,809 spectra at coordinates x=82--272 and
+y=340--459. Dataset 2 contains 14,822 spectra at x=1--139 and y=1--107.
+
+Spectrum representation is taken from CV metadata, never inferred from a file
+name. Dataset 1 is processed with variable per-spectrum peak lists, but its imzML
+does not explicitly declare centroid/profile CV metadata. Dataset 2 is processed,
+profile, and variable-axis. The two files of a non-matching-basename pair are
+linked read-only in a temporary working directory for Cardinal; originals are not
+renamed or modified.
+
+## Step 2: Spectral processing/alignment
+
+Dataset 1 uses `Cardinal::peakAlign(tolerance=10, units="ppm")` directly on the
+stored processed peak lists. It does not perform raw profile peak picking. The
+real run retained all 17,809 coordinates and produced 6,909 aligned features from
+333--456 stored peaks per spectrum.
+
+Dataset 2 uses the prespecified sequence:
 
 ```text
-Input -> 1. validation/provenance -> 2. imzML feature matrix
-      -> 3. pixel/feature QC -> 4. TIC normalization + log1p
-      -> 5. standardized output + manifest
+Cardinal::peakPick(method="diff", SNR=6)
+→ Cardinal::peakAlign(tolerance=10, units="ppm")
+→ detection frequency ≥10%
 ```
 
-## Step 1: input validation and provenance
+The real run aligned 803 peaks and retained 196 features. This is an independently
+documented package workflow and is **not** claimed to reproduce the publication's
+2,162-feature matrix.
 
-For imzML input, supply the `.imzML` path, its same-basename `.ibd`, sample and
-section identifiers, and an explicit ion mode. `annotation.tsv` is not used to
-pre-filter MSI features; it is only used later for one-to-many putative
-accurate-mass annotation.
+## Step 3: QC and normalization
 
-```{r processing-step-1, eval=FALSE}
-library(SpatialOmicsMSI)
+QC records pixels, coordinate uniqueness, raw array lengths, m/z range, missing
+values, zero fraction and detection frequency. Analysis values use per-pixel TIC
+normalization followed by `log10(x + 1)`; the untransformed arrays remain available for
+TIC and provenance checks. No unmeasured background pixels are interpolated.
 
-root <- "data_raw/msiflow/ly6g_heterogeneity_signatures"
-imzml <- file.path(root, "msi", "UPEC_12.imzML")
-ibd <- sub("[.]imzML$", ".ibd", imzml)
-stopifnot(file.exists(imzml), file.exists(ibd))
-
-input_manifest <- make_pipeline_manifest(
-  input_files = c(imzml, ibd),
-  input_type = "shared_axis_centroided_imzML",
-  ion_mode = "positive",
-  ppm = 10,
-  parameters = list(
-    sample_id = "UPEC_12",
-    section_id = "UPEC_12",
-    ion_mode_source = "inferred_from_annotation_adducts"
-  )
-)
+```{r omix-tic, fig.cap="OMIX016317 real IBD TIC image. Every mark is a measured pixel; no interpolation or background filling."}
+knitr::include_graphics("real_assets_mouse_brain/omix016317_tic.png")
 ```
 
-The provenance must state that polarity was not established from imzML CV metadata.
+## Step 4: Spatial registration/context construction
 
-## Step 2: centroided imzML/ibd reading and feature-matrix construction
+For Brain01, the METASPACE API matrix maps relative MSI coordinates to optical
+pixels. The origin `(82,340)` is derived from coordinate minima rather than
+hard-coded. Both coordinate systems increase x rightward and y downward; no y
+inversion is applied. The platform matrix uniquely maps the acquisition to the
+third of five visible sections.
 
-`load_centroided_msi_features()` verifies the companion `.ibd`, MS1 spectra, a
-shared m/z axis, and intensity-array orientation. It retains full-precision m/z in
-`feature_metadata`; stable unique column names do not replace scientific m/z values.
-
-```{r processing-step-2, eval=FALSE}
-upec12 <- load_centroided_msi_features(
-  imzml_path = imzml,
-  sample_id = "UPEC_12",
-  section_id = "UPEC_12",
-  ion_mode = "positive",
-  ion_mode_source = "inferred_from_annotation_adducts"
-)
-
-pixel_feature_matrix <- upec12$pixel_feature_matrix
-coordinates <- upec12$coordinates
-feature_metadata <- upec12$feature_metadata
-stopifnot(nrow(pixel_feature_matrix) == 7036L)
-stopifnot(nrow(feature_metadata) == 252L)
+```{r brightfield, fig.cap="Original METASPACE optical brightfield. This is not relabelled as H&E."}
+knitr::include_graphics("real_assets_mouse_brain/brain01_optical_brightfield.png")
 ```
 
-The observed UPEC_12 output contains 7,036 pixels and all 252 measured shared-axis
-features. UPEC_13, UPEC_14, and UPEC_15 also contain 252 features, and their numeric
-m/z axes match UPEC_12 exactly (maximum observed axis difference: 0 ppm).
-
-## Step 3: pixel and feature QC
-
-QC is performed on measured features before annotation. Coordinates must be finite
-and unique within a section; feature intensities must be finite and non-negative;
-zero-TIC pixels cannot enter normalization.
-
-```{r processing-step-3, eval=FALSE}
-feature_columns <- feature_metadata$column_name
-intensity <- as.matrix(pixel_feature_matrix[, feature_columns, drop = FALSE])
-
-stopifnot(all(is.finite(coordinates$x)), all(is.finite(coordinates$y)))
-stopifnot(!anyDuplicated(coordinates[c("section_id", "x", "y")]))
-stopifnot(all(is.finite(intensity)), all(intensity >= 0))
-
-tic <- rowSums(intensity)
-keep_pixel <- is.finite(tic) & tic > 0
-qc_summary <- data.frame(
-  input_pixels = nrow(intensity),
-  retained_pixels = sum(keep_pixel),
-  removed_nonpositive_tic = sum(!keep_pixel),
-  measured_features = ncol(intensity)
-)
+```{r registration, fig.cap="Live package-generated platform-transform measurement-mask overlay; no transform parameter was fitted manually."}
+knitr::include_graphics("real_assets_mouse_brain/brain01_live_measurement_overlay.png")
 ```
 
-## Step 4: TIC normalization and log1p transformation
+The symmetric boundary-distance diagnostic was 4.12 optical pixels at the median
+and 15.52 pixels at the 95th percentile. A diagnostic forced y inversion reduced
+Dice to 0.90168.
 
-Each sample is normalized separately. Transformation order is recorded and fixed:
-per-pixel TIC normalization first, then `log1p`. Samples are not joined into one
-spatial graph.
+## Step 5: Standardized output generation
 
-```{r processing-step-4, eval=FALSE}
-intensity <- intensity[keep_pixel, , drop = FALSE]
-tic <- tic[keep_pixel]
-tic_normalized <- intensity / tic
-analysis_matrix <- log1p(tic_normalized)
-stopifnot(all(is.finite(analysis_matrix)))
-
-processing_parameters <- list(
-  normalization = "per-pixel TIC",
-  transformation = "log1p",
-  transformation_order = "TIC normalization then log1p"
-)
-```
-
-## Step 5: standardized outputs and manifest
-
-One run writes the pixel-by-feature matrix, coordinates, feature metadata, QC,
-parameters, and provenance. These outputs are sufficient to restart analysis without
-re-reading raw binary arrays.
-
-```{r processing-step-5, eval=FALSE}
-standard_output <- "results/real_data/UPEC_12"
-write_pipeline_outputs(
-  output_dir = standard_output,
-  pixel_matrix = pixel_feature_matrix[keep_pixel, , drop = FALSE],
-  coordinates = coordinates[keep_pixel, , drop = FALSE],
-  feature_metadata = feature_metadata,
-  qc_summary = qc_summary,
-  processing_parameters = processing_parameters,
-  provenance = c(
-    upec12$provenance,
-    list(
-      polarity_cv_metadata_established = FALSE,
-      input_manifest = input_manifest
-    )
-  )
-)
-```
+Each MSI run returns the same contract: `pixel_feature_matrix`, `coordinates`,
+`feature_metadata`, `qc_summary`, `parameters`, and `provenance`. Parameters record
+peak picking, SNR, ppm alignment, detection filtering, polarity source, software
+versions and checksums. Shiny retains large matrices in its R session and exposes
+only previews and downloadable standardized tables. Each browser session has an
+independent temporary output directory.
 
 # Data Analysis
 
-The workflow answers four prespecified questions. Annotation is downstream of MSI
-measurement and never controls which of the 252 features enters spatial analysis.
+## Task 1: Complete-brain ion visualization and QC
 
-## Task 1: UPEC_12 spatially variable metabolites
+OMIX016317 was accepted because real intensity images show a closed, untruncated
+mouse-brain section; it is not a coordinate-only or preselected-pixel claim.
 
-The primary graph is symmetric binary Queen adjacency at distance
-(sqrt{2}); Rook adjacency at distance 1 is a sensitivity analysis. Isolated pixels
-do not enter the Moran mean, denominator, or permutations.
-
-```{r analysis-task-1, eval=FALSE}
-queen <- build_spatial_neighbors(
-  coordinates$x, coordinates$y,
-  method = "queen", distance_threshold = sqrt(2),
-  weights = "binary", symmetric = TRUE
-)
-rook <- build_spatial_neighbors(
-  coordinates$x, coordinates$y,
-  method = "rook", distance_threshold = 1,
-  weights = "binary", symmetric = TRUE
-)
-
-queen_result <- compute_spatially_variable_metabolites(
-  pixel_matrix = data.frame(coordinates[c("x", "y")], analysis_matrix),
-  coordinates = coordinates,
-  n_perm = 499,
-  alternative = "two.sided",
-  p_adjust_method = "BH",
-  seed = 20260806,
-  neighbors = queen
-)
+```{r omix-mask, fig.cap="Data-derived OMIX016317 tissue/background mask used for QC, not an anatomical ROI."}
+knitr::include_graphics("real_assets_mouse_brain/omix016317_tissue_mask.png")
 ```
 
-Observed diagnostics and results were:
-
-| Metric | Queen | Rook |
-|---|---:|---:|
-| Total pixels | 7,036 | 7,036 |
-| Effective pixels | 6,992 | 6,935 |
-| Isolated pixels | 44 | 101 |
-| Undirected edges | 19,291 | 10,223 |
-| Connected components | 329 | 408 |
-| BH-FDR significant features | 184 | 166 |
-
-Queen/Rook Moran rankings had Spearman correlation 0.97285. Their significant sets
-overlapped in 157 features with Jaccard 0.8135. With 499 permutations, the minimum
-attainable permutation p-value is (1/(499+1)=0.002); values at 0.002 indicate the
-permutation resolution limit, not zero probability.
-
-## Task 2: data-driven metabolic domains
-
-The archive's `umap_data.csv` labels are mapped by sample, x, and y with a strict
-one-to-one coordinate check. Values 0--2 are called data-driven metabolic domains;
--1 remains unclassified/background.
-
-```{r analysis-task-2, eval=FALSE}
-domain_pixels <- map_spatial_domain_labels(
-  pixel_matrix = pixel_feature_matrix,
-  umap_path = file.path(root, "umap_data.csv"),
-  sample_id = "UPEC_12"
-)
-stopifnot(!anyNA(domain_pixels$domain_id))
-
-formal_domain_pixels <- domain_pixels$domain_id %in% 0:2
+```{r omix-gate, fig.cap="Full acquisition field retained for QC (left) and the reproducible raw-TIC/peak-count tissue gate (right). Grey pixels remain unclassified/background."}
+knitr::include_graphics("real_assets_mouse_brain/omix016317_full_field_tissue_gate.png")
 ```
 
-For UPEC_12, pixel counts were 485 in -1, 1,417 in domain 0, 688 in domain 1,
-and 4,446 in domain 2. Because these domains were learned from the same MSI feature
-space being characterized, domain contrasts have circularity risk and are not
-independent anatomical ROI validation.
+```{r omix-ion, fig.cap="Real OMIX016317 ion image at measured MSI m/z 775.55261535. No interpolation."}
+knitr::include_graphics("real_assets_mouse_brain/omix016317_ion_775_55262.png")
+```
 
-## Task 3: UPEC_12--UPEC_15 subject-paired domain characterization
+## Task 2: Brightfield–MSI registration and ROI transfer
 
-Each subject-by-domain-by-feature value is first reduced to one mean. Domain 0 versus
-1, 0 versus 2, and 1 versus 2 are then evaluated with subject-paired tests; pixels
-and tiles never enter the replicate count.
+The registered measurement mask, TIC and ion layers share the same platform
+transform. Optical regions can therefore be transferred reproducibly, while their
+origin remains optical context rather than a same-section molecular validation.
 
-```{r analysis-task-3, eval=FALSE}
-# `subject_domain_matrix` has one row per subject x domain and feature columns.
-paired_domains <- differential_region_analysis(
-  sample_matrix = subject_domain_matrix,
-  group_column = "domain_id",
-  subject_column = "subject_id",
+```{r brain01-tic, fig.cap="Live package-generated Brain01 TIC overlay using the METASPACE transform."}
+knitr::include_graphics("real_assets_mouse_brain/brain01_live_tic_overlay.png")
+```
+
+```{r brain01-ion, fig.cap="Live representative-ion overlay generated from the current Brain01 alignment."}
+knitr::include_graphics("real_assets_mouse_brain/ion_X798.540963_overlay.png")
+```
+
+## Task 3: Spatially variable metabolite analysis with Queen/Rook sensitivity
+
+The package constructs symmetric binary Queen or Rook graphs, reports edges,
+isolates, effective N and connected components, and excludes isolates from the
+Moran mean, denominator and permutations. The primary analysis uses 499 two-sided
+permutations, fixed seed and BH-FDR; its minimum attainable permutation p-value is
+0.002. Queen and Rook are reported together as a graph-sensitivity analysis.
+
+The tissue-only OMIX016317 run used seed 20260808. The primary gate retained
+6,589 of 14,822 scan pixels as the largest connected tissue component; 8,233
+pixels remained unclassified/background. Queen contained 25,426 undirected
+edges, 6,589 effective pixels and no isolates; Rook contained 12,771 edges.
+Two score-threshold sensitivity gates retained 6,969 and 6,379 tissue pixels.
+Their Queen Moran rankings correlated 0.99416 and 0.99405 with the primary gate,
+showing that the ranking was not determined by one threshold alone.
+All 196 features reached BH-FDR
+<0.05 under both graphs. Tissue-only Queen/Rook rankings had Spearman correlation
+0.99582, overlap 196 and Jaccard 1.0.
+Results at p=0.002 reached the permutation resolution
+limit and are not interpreted as exact zero probabilities.
+
+```{r omix-moran, fig.cap="Real OMIX016317 Queen Moran ranking; red denotes BH-FDR <0.05. TIC normalization, log10(x + 1) and 499 two-sided permutations."}
+knitr::include_graphics("real_assets_mouse_brain/omix016317_tissue_moran_rank_fdr.png")
+```
+
+```{r omix-top-moran, fig.cap="Top real Queen Moran ion image, measured pixels only."}
+knitr::include_graphics("real_assets_mouse_brain/omix016317_tissue_top_queen.png")
+```
+
+Data-driven metabolic domains, when supplied, remain distinct from anatomical ROI.
+Label -1 is `unclassified/background`. Pixel-level domains are not treated as
+biological replicates.
+
+An exploratory k=4 PCA/k-means characterization was run only on tissue pixels
+(10 PCs, seed 20260808), explained 79.02% of variance and produced domain pixel
+counts 1,774, 348, 3,851 and 616; all 8,233 background pixels remain label -1.
+These are descriptive data-driven exploratory metabolic domains; this single
+section does not support inferential domain DE.
+
+```{r omix-domains, fig.cap="OMIX016317 data-driven exploratory metabolic domains; not anatomical regions and no pixel-level inferential DE."}
+knitr::include_graphics("real_assets_mouse_brain/omix016317_tissue_only_domains.png")
+```
+
+## Task 4: LC-MS/MS precursor/fragment orthogonal support
+
+The OMIX MSI feature m/z 775.55261535 differs from the demonstration LC-MS/MS
+reference precursor 775.550137928655 by 3.19 ppm. In MSV000090179, the positive
+file contains an MS2 scan at selected precursor 775.5478 (RT 46.86465 min,
+collision energy 30, isolation window ±0.5), and the negative file contains an MS2
+scan at 775.5501 (RT 32.54018 min, collision energy 30, isolation window ±0.5).
+
+```{r pos-fragments, fig.cap="Positive-mode unassigned fragment spectrum. It is displayed without diagnostic-ion or structural claims."}
+knitr::include_graphics("real_assets_mouse_brain/msv000090179_positive_fragment_spectrum.png")
+```
+
+```{r neg-fragments, fig.cap="Negative-mode unassigned fragment spectrum from the independent companion dataset."}
+knitr::include_graphics("real_assets_mouse_brain/msv000090179_negative_fragment_spectrum.png")
+```
+
+These data provide precursor-level and fragment-spectrum **orthogonal support**.
+No diagnostic-ion definition has been supplied for this target, so the workflow
+does not assign a chemical structure and does not emit `confirmed`, `validated
+structure`, or `independent structural confirmation`. The LC-MS/MS samples are not
+pixel matched or same-sample paired to either MSI dataset.
+
+## Multimodal label paths for niche analysis
+
+The package accepts three label paths through one validated structure:
+
+1. Spatial-transcriptomics NNLS provides soft cell-type composition estimates.
+   For multi-cell spots, retain these proportions and call
+   `compute_neighborhood_composition_soft()`; a dominant hard label discards
+   mixture information. The cosine option is an exploratory label-transfer
+   score and is not a cell-fraction estimate.
+2. Pure-R EBImage watershed segmentation followed by morphology-feature
+   k-means produces `morphology_class_*` nuclear classes. These define
+   exploratory **histomorphology niches**, not biological cell-type niches.
+   Global luminance Otsu thresholding is a baseline whose mask, size filtering,
+   and registration must be visually checked for each staining batch.
+3. Precomputed external labels can be validated with
+   `prepare_cell_type_labels()` and transferred using exact shared coordinates
+   or a region-restricted nearest neighbor. Nearest-neighbor transfer requires
+   an explicit maximum distance and, for histology coordinates, a fitted
+   histology-to-MSI registration with reported residual error.
+
+All three paths retain source, entity, coordinate-system, confidence, matching
+distance, and section provenance. They should be compared as sensitivity or
+complementary evidence; agreement is not independent validation when the paths
+share a registration, tissue image, or reference atlas.
+
+Neighborhood enrichment answers a separate, global question: whether pairs of
+hard labels have more or fewer graph adjacencies than expected after labels are
+permuted within section. It does not assign a niche to each position.
+
+```r
+enrichment <- compute_neighborhood_enrichment(
+  cell_type_labels = typed_pixels$cell_type,
+  neighbors = neighbors,
+  region_id = typed_pixels$section_id,
+  n_perm = 1000,
+  seed = 1
+)
+enrichment$pair_table
+```
+
+`group_cell_types_from_enrichment()` may organize the heatmap by similarity of
+complete z-score profiles. Its output is an interaction-profile grouping, not a
+replacement for Schurch-style composition-vector niches. Undefined z-scores
+from zero-variance permutation nulls remain `NA` by default and must not be
+silently interpreted as zero enrichment.
+
+## Distance-to-domain gradients
+
+Distance analysis requires explicit topology increments, physical resolution,
+units, ring construction, component handling, and domain provenance. Topology
+is constructed from grid coordinates; physical coordinates are used only for
+the metric. This prevents changing the neighbor graph when grid coordinates are
+converted to micrometres.
+
+```r
+gradient <- analyze_distance_gradient(
+  pixel_matrix = typed_pixels,
+  domain_column = "roi_id",
+  target_domain = "roi_cluster_1",
+  ring_method = "fixed_breaks",
+  ring_breaks = c(0, 50, 100, 200, 400),
+  x_resolution = 50,
+  y_resolution = 50,
+  topology_x_step = 1,
+  topology_y_step = 1,
+  distance_unit = "um",
+  domain_source_features = character(0), # only if independently defined
   section_column = "section_id",
-  p_adjust_method = "BH"
+  subject_column = "biological_subject_id",
+  analysis_mode = "population_subject"
 )
 ```
 
-All four samples had complete coordinate/domain mappings. At (n=4), the exploratory
-BH-FDR counts were 59 features for domain 0 versus 1, 107 for domain 0 versus 2,
-and 0 for domain 1 versus 2. These small-sample paired results characterize the
-published data-driven domains; they do not establish anatomical regions or generalize
-beyond this proof-of-concept cohort.
+Population models use subject-by-section-by-ring profiles, never raw pixels.
+Pixel-level GAMs are available as descriptive curves and deliberately return no
+p-value. The observed-grid perimeter includes acquisition edges, holes, and
+missing coordinates and is not automatically a biological tissue outline.
+Features used to construct a metabolic domain cannot be tested as independent
+distance-gradient discoveries unless circular analysis is explicitly enabled
+and described as such.
 
-## Task 4: PC(O-16:0_20:4) fragment-level orthogonal support
+## Gaussian spatial mixed-effects region analysis
 
-Diagnostic ions are supplied explicitly. The function never assigns chemistry from
-an unlabelled peak. A core scan must satisfy both selected-precursor tolerance and
-isolation-window coverage. Profile-derived local maxima retain their extraction
-method, parameters, and software version.
+For approximately Gaussian transformed subregion intensities, the spatial LMM
+uses nested subject/section random intercepts and confines residual spatial
+correlation to each subject-section field. Subregion center coordinates and
+their physical unit must be supplied explicitly. Repeated coordinates within a
+field are rejected rather than randomly jittered.
 
-```{r analysis-task-4, eval=FALSE}
-pos_ions <- data.frame(
-  label = "phosphocholine_184_07",
-  target_mz = 184.07,
-  evidence_role = "positive_mode_PC_class_fragment"
-)
-pos_support <- validate_msms_fragment_evidence(
-  precursor_scans = pos_scan_metadata,
-  fragment_peaks = pos_fragment_peaks,
-  diagnostic_ions = pos_ions,
-  precursor_target = 768.5902,
-  precursor_ppm_tolerance = 10,
-  fragment_tolerance = 0.02,
-  fragment_tolerance_unit = "Da",
-  min_relative_intensity = 0.01,
-  min_core_scans = 2,
-  required_diagnostic_labels = "phosphocholine_184_07"
-)
-
-neg_ions <- data.frame(
-  label = c("M_minus_CH3_752_56", "FA_20_4_303_23",
-            "FA_20_4_minus_CO2_259_24", "dLPC_16_0_466_33"),
-  target_mz = c(752.56, 303.23, 259.24, 466.33),
-  evidence_role = c("additional_consistency", "20:4_acyl_chain",
-                    "additional_20:4_consistency", "16:0_lyso_fragment")
-)
-neg_support <- validate_msms_fragment_evidence(
-  precursor_scans = neg_scan_metadata,
-  fragment_peaks = neg_fragment_peaks,
-  diagnostic_ions = neg_ions,
-  precursor_target = 812.5811,
-  precursor_ppm_tolerance = 10,
-  fragment_tolerance = 0.02,
-  fragment_tolerance_unit = "Da",
-  min_relative_intensity = 0.01,
-  min_core_scans = 2,
-  required_diagnostic_labels = c("FA_20_4_303_23", "dLPC_16_0_466_33")
+```r
+spatial_lmm <- differential_region_analysis_spatial_lmm(
+  sample_matrix = subregion_matrix,
+  group_column = "roi_id",
+  subject_column = "biological_subject_id",
+  section_column = "section_id",
+  x_col = "x_center",
+  y_col = "y_center",
+  x_resolution = 50,
+  y_resolution = 50,
+  distance_unit = "um",
+  correlation_structure = "exponential"
 )
 ```
 
-The real POS file produced 17 selected-ion matches for 768.5902 and 10 core scans;
-184.07 reached repeated diagnostic support in all 10 core scans. The NEG file
-produced six selected-ion matches for the formate adduct 812.5811 and five core
-scans. Core scans meeting the 1% base-peak threshold numbered five for 752.56,
-four for 303.23, three for 259.24, and four for 466.33. Thus POS PC-class support,
-NEG 20:4 support, NEG 16:0 support, and the explicit overall rule were all `TRUE`.
+The spatial marginal group test is omnibus; `contrasts` reports pairwise fixed
+effects and confidence intervals. The corresponding independence LMM and
+AIC/BIC differences are sensitivity summaries, not a regular likelihood-ratio
+test proving spatial autocorrelation. This is a Gaussian spatial LMM, not a
+binomial, count, zero-inflated, or other non-Gaussian GLMM.
 
-The recommended result label is `fragment_level_orthogonal_support`. The source
-mzML marks these MS2 spectra as profile; local maxima were derived with
-`scipy.signal.find_peaks(prominence=0)` and are not vendor centroid data. The combined
-evidence is consistent with the paper-reported PC(O-16:0_20:4) assignment, but the
-LC-MS/MS dataset is companion rather than pixel-level or same-sample paired evidence.
+# Scientific limitations
 
-Putative accurate-mass annotations remain one-to-many and must retain the label
-`putative_accurate_mass_annotation`. Neither accurate-mass matching nor fragment-level
-orthogonal support should be converted into an unqualified structure claim.
+- Dataset 1 begins from processed sparse peak lists; it is not raw profile peak picking.
+- Dataset 2 processing parameters are package-defined and do not reproduce the paper's feature table.
+- Spatial domains are data-driven, not anatomical ROI, unless independently transferred from optical context.
+- Accurate-mass relationships are putative and do not establish structure.
+- The three datasets validate complementary modules only and cannot support a joint biological conclusion.
+
+<details><summary>Session information</summary>
 
 ```{r session-info}
 sessionInfo()
 ```
+
+</details>

@@ -1,13 +1,14 @@
 # Run Path B: MetaboAnalystR mummichog/MS Peaks-to-Pathways.
 #
-# R console usage:
-# setwd("/Users/ly/Documents/Spatial Omics")
-# source("scripts/run_path_b_metaboanalyst_mummichog.R")
+# Run from the repository root after setting SPATIALOMICS_RAT_BRAIN_DIR.
+source("scripts/_bootstrap.R")
 
 library(MetaboAnalystR)
 
 if (!exists("data_dir", inherits = TRUE)) {
-  data_dir <- "/Users/ly/Desktop/Jeff Xia/rat_brain_data"
+  data_dir <- spatialomics_data_dir(
+    "SPATIALOMICS_RAT_BRAIN_DIR", "data_raw/rat_brain_data", "Rat-brain data"
+  )
 }
 if (!exists("ppm", inherits = TRUE)) ppm <- 5.0
 if (!exists("ion_mode", inherits = TRUE)) ion_mode <- "negative"

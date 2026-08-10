@@ -5,22 +5,15 @@
 # machinery is reused here because it operates on a generic section_column.
 # In this script, section_id means mouse/replicate ID, not tissue depth.
 #
-# R console usage:
-# setwd("/Users/ly/Documents/Spatial Omics")
-# Sys.setenv(SPATIALOMICS_SMA_DIR = "/Users/ly/Desktop/Jeff Xia/sma_data")
-# source("scripts/test_dhb_biological_replicate_workflow.R")
+# Run from the repository root after setting SPATIALOMICS_SMA_DIR.
 
 library(ggplot2)
+source("scripts/_bootstrap.R")
+load_spatialomics_code()
 
-if (file.exists("R/msi_pipeline.R")) {
-  source("R/msi_pipeline.R")
-} else {
-  library(SpatialOmicsMSI)
-}
-
-default_sma_dir <- "/Users/ly/Desktop/Jeff Xia/13 Jun/msi"
-if (!dir.exists(default_sma_dir)) default_sma_dir <- file.path("data", "sma_data")
-data_dir <- Sys.getenv("SPATIALOMICS_SMA_DIR", unset = default_sma_dir)
+data_dir <- spatialomics_data_dir(
+  "SPATIALOMICS_SMA_DIR", "data_raw/sma_data", "SMA/DHB data"
+)
 out_dir <- file.path(data_dir, "dhb_replicate_test_outputs")
 plot_dir <- file.path(out_dir, "plots")
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)

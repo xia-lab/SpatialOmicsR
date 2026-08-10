@@ -1,8 +1,6 @@
 # Downstream MetaboAnalystR statistical analysis
 #
-# R console usage:
-# setwd("/Users/ly/Documents/Spatial Omics")
-# Sys.setenv(SPATIALOMICS_RAT_BRAIN_DIR = "/Users/ly/Desktop/Jeff Xia/rat_brain_data")
+# Run from the repository root after setting SPATIALOMICS_RAT_BRAIN_DIR.
 #
 # Default: build an all-cluster MetaboAnalystR input from spatial_test_outputs/clustered_matrix.csv
 # source("scripts/downstream_metaboanalyst_analysis.R")
@@ -11,6 +9,8 @@
 # input_csv <- "/path/to/metaboanalyst_data.csv"
 # output_dir <- "/path/to/metaboanalyst_results"
 # source("scripts/downstream_metaboanalyst_analysis.R")
+
+source("scripts/_bootstrap.R")
 
 required_pkgs <- c("MetaboAnalystR", "RSclient", "factoextra", "ggplot2", "pls")
 missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
@@ -169,13 +169,11 @@ plot_local_sample_norm_summary <- function(raw_data, norm_data, groups, output_f
   invisible(output_file)
 }
 
-if (file.exists("R/msi_pipeline.R")) {
-  source("R/msi_pipeline.R")
-} else {
-  library(SpatialOmicsMSI)
-}
+load_spatialomics_code()
 
-data_dir <- Sys.getenv("SPATIALOMICS_RAT_BRAIN_DIR", unset = file.path("data", "rat_brain_data"))
+data_dir <- spatialomics_data_dir(
+  "SPATIALOMICS_RAT_BRAIN_DIR", "data_raw/rat_brain_data", "Rat-brain data"
+)
 test_out_dir <- file.path(data_dir, "spatial_test_outputs")
 
 if (!exists("output_dir", inherits = TRUE)) {
@@ -203,6 +201,18 @@ if (!exists("input_csv", inherits = TRUE)) {
     row.names = FALSE
   )
 }
+
+# Inputs produced by this package's preprocessing workflow have already been
+# transformed with log10(x + 1). Do not apply MetaboAnalystR LogNorm to those
+# values a second time. Set input_already_log_transformed <- FALSE before
+# sourcing this script only when supplying an untransformed external input_csv.
+if (!exists("input_already_log_transformed", inherits = TRUE)) {
+  input_already_log_transformed <- TRUE
+}
+if (length(input_already_log_transformed) != 1L || is.na(input_already_log_transformed)) {
+  stop("input_already_log_transformed must be TRUE or FALSE.", call. = FALSE)
+}
+metabo_transform <- if (isTRUE(input_already_log_transformed)) "NULL" else "LogNorm"
 
 if (!file.exists(input_csv)) stop("Missing input file: ", input_csv, call. = FALSE)
 
@@ -279,10 +289,21 @@ if (!file.exists("data_proc.qs") && file.exists("preproc.qs")) {
 mSet <- Normalization(
   mSet,
   rowNorm = "NULL",
-  transNorm = "LogNorm",
+  transNorm = metabo_transform,
   scaleNorm = "AutoNorm",
   ratio = FALSE,
   ratioNum = 20
+)
+
+write.csv(
+  data.frame(
+    input_already_log_transformed = isTRUE(input_already_log_transformed),
+    MetaboAnalystR_transNorm = metabo_transform,
+    scaleNorm = "AutoNorm",
+    stringsAsFactors = FALSE
+  ),
+  file.path(output_dir, "metaboanalyst_normalization_parameters.csv"),
+  row.names = FALSE
 )
 
 # MetaboAnalystR 4.3.0 can drop class labels after Normalization() for this

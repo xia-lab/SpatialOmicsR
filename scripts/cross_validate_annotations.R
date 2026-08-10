@@ -1,26 +1,29 @@
 # Cross-validate MZmine features, SwissLipids candidates, and METASPACE annotations.
 #
-# R console usage:
-# setwd("/Users/ly/Documents/Spatial Omics")
-# feature_csv <- "/Users/ly/Desktop/Jeff Xia/rat_brain_data/Filtered_7E4.csv"
-# swisslipids_csv <- "/path/to/swisslipids_species_filtered.csv"
-# metaspace_csv <- "/Users/ly/Desktop/Jeff Xia/rat_brain_data/annotations.csv"
-# source("scripts/cross_validate_annotations.R")
+# Run from the repository root. Configure the data paths through the
+# SPATIALOMICS_RAT_BRAIN_DIR, SPATIALOMICS_SWISSLIPIDS_CSV and
+# SPATIALOMICS_METASPACE_ANNOTATIONS environment variables.
+source("scripts/_bootstrap.R")
+load_spatialomics_code()
 
-if (file.exists("R/msi_pipeline.R")) {
-  source("R/msi_pipeline.R")
-} else {
-  library(SpatialOmicsMSI)
-}
+data_dir <- spatialomics_data_dir(
+  "SPATIALOMICS_RAT_BRAIN_DIR", "data_raw/rat_brain_data", "Rat-brain data"
+)
 
 if (!exists("feature_csv", inherits = TRUE)) {
-  feature_csv <- "/Users/ly/Desktop/Jeff Xia/rat_brain_data/Filtered_7E4.csv"
+  feature_csv <- file.path(data_dir, "Filtered_7E4.csv")
 }
 if (!exists("metaspace_csv", inherits = TRUE)) {
-  metaspace_csv <- "/Users/ly/Desktop/Jeff Xia/rat_brain_data/annotations.csv"
+  metaspace_csv <- Sys.getenv(
+    "SPATIALOMICS_METASPACE_ANNOTATIONS",
+    unset = file.path(data_dir, "annotations.csv")
+  )
 }
 if (!exists("swisslipids_csv", inherits = TRUE)) {
-  swisslipids_csv <- "/Users/ly/Downloads/swisslipids_species_filtered.csv"
+  swisslipids_csv <- Sys.getenv(
+    "SPATIALOMICS_SWISSLIPIDS_CSV",
+    unset = file.path(data_dir, "swisslipids_species_filtered.csv")
+  )
 }
 if (!exists("ppm", inherits = TRUE)) ppm <- 5
 

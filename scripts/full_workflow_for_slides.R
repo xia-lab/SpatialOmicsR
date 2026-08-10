@@ -4,13 +4,13 @@
 # It creates CSV outputs and slide-ready PNG figures under:
 # <SPATIALOMICS_RAT_BRAIN_DIR>/spatial_outputs
 
-library(SpatialOmicsMSI)
 library(ggplot2)
-if (file.exists("R/msi_pipeline.R")) {
-  source("R/msi_pipeline.R")
-}
+source("scripts/_bootstrap.R")
+load_spatialomics_code()
 
-data_dir <- Sys.getenv("SPATIALOMICS_RAT_BRAIN_DIR", unset = file.path("data", "rat_brain_data"))
+data_dir <- spatialomics_data_dir(
+  "SPATIALOMICS_RAT_BRAIN_DIR", "data_raw/rat_brain_data", "Rat-brain data"
+)
 out_dir <- file.path(data_dir, "spatial_outputs")
 plot_dir <- file.path(out_dir, "plots_for_slides")
 

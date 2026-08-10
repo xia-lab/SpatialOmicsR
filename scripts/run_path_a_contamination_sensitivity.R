@@ -1,14 +1,14 @@
 # Path A contamination sensitivity analysis.
 #
-# R console usage:
-# setwd("/Users/ly/Documents/Spatial Omics")
-# source("scripts/run_path_a_contamination_sensitivity.R")
-
-source("R/msi_pipeline.R")
+# Run from the repository root after setting SPATIALOMICS_RAT_BRAIN_DIR.
+source("scripts/_bootstrap.R")
+load_spatialomics_code()
 library(MetaboAnalystR)
 
 if (!exists("data_dir", inherits = TRUE)) {
-  data_dir <- "/Users/ly/Desktop/Jeff Xia/rat_brain_data"
+  data_dir <- spatialomics_data_dir(
+    "SPATIALOMICS_RAT_BRAIN_DIR", "data_raw/rat_brain_data", "Rat-brain data"
+  )
 }
 if (!exists("kegg_organism", inherits = TRUE)) kegg_organism <- "rno"
 if (!exists("kegg_library_version", inherits = TRUE)) kegg_library_version <- "current"

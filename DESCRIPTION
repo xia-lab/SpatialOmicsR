@@ -1,14 +1,15 @@
 Package: SpatialOmicsMSI
 Type: Package
-Title: Spatial MSI Feature Extraction and MetaboAnalyst Export
+Title: Reproducible Spatial Mass Spectrometry Imaging Analysis
 Version: 0.3.1
 Authors@R: person("Spatial Omics", "Team", role = c("aut", "cre"), email = "noreply@example.com")
 Author: Spatial Omics Team
 Maintainer: Spatial Omics Team <noreply@example.com>
-Description: Utilities for targeted mass spectrometry imaging feature extraction,
-    feature selection, preprocessing, spatial clustering, sub-region sampling,
-    MetaboAnalyst export, MetaboAnalyst result import normalization, and spatial
-    back-mapping.
+Description: Function-first tools for mass spectrometry imaging import and
+    validation, quality control, feature preprocessing, spatial graphs,
+    spatially variable feature analysis, spatial clustering, region and niche
+    analysis, subject-aware differential testing, ligand-receptor sensitivity
+    analysis, pathway integration, visualization, and auditable export.
 License: MIT + file LICENSE
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
@@ -20,6 +21,11 @@ Imports:
     stats,
     utils
 Suggests:
+    EBImage,
+    jpeg,
+    mgcv,
+    nlme,
+    nnls,
     Cardinal,
     shiny,
     ggplot2,
@@ -29,5 +35,7 @@ Suggests:
     tidyselect,
     zip,
     knitr,
-    rmarkdown
+    rmarkdown,
+    jsonlite,
+    base64enc
 VignetteBuilder: knitr

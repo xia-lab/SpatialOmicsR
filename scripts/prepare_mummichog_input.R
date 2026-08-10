@@ -3,18 +3,14 @@
 # This script reuses the existing all-cluster sample mapping, but averages all
 # 137 preprocessed mz features instead of only the feature-selected subset.
 #
-# R console usage:
-# setwd("/Users/ly/Documents/Spatial Omics")
-# source("scripts/prepare_mummichog_input.R")
-
-if (file.exists("R/msi_pipeline.R")) {
-  source("R/msi_pipeline.R")
-} else {
-  library(SpatialOmicsMSI)
-}
+# Run from the repository root after setting SPATIALOMICS_RAT_BRAIN_DIR.
+source("scripts/_bootstrap.R")
+load_spatialomics_code()
 
 if (!exists("data_dir", inherits = TRUE)) {
-  data_dir <- "/Users/ly/Desktop/Jeff Xia/rat_brain_data"
+  data_dir <- spatialomics_data_dir(
+    "SPATIALOMICS_RAT_BRAIN_DIR", "data_raw/rat_brain_data", "Rat-brain data"
+  )
 }
 if (!exists("test_out_dir", inherits = TRUE)) {
   test_out_dir <- file.path(data_dir, "spatial_test_outputs")
@@ -88,8 +84,10 @@ stats_rows <- lapply(fcols, function(feature) {
   max_mean <- max(group_means, na.rm = TRUE)
   min_mean <- min(group_means, na.rm = TRUE)
 
-  # The preprocessed features are log10-transformed; convert max-min log10
-  # difference to an approximate signed log2 fold-change for ranking.
+  # The preprocessed features are log10-transformed; convert the difference
+  # between the highest-mean and lowest-mean groups to an approximate log2 fold
+  # change for ranking. The sign is non-negative by construction and does not
+  # encode a prespecified reference-group direction.
   signed_log2fc <- (max_mean - min_mean) * log2(10)
 
   data.frame(
@@ -102,6 +100,10 @@ stats_rows <- lapply(fcols, function(feature) {
     min_group = min_group,
     max_group_mean = max_mean,
     min_group_mean = min_mean,
+    effect_contrast = paste0(max_group, "_vs_", min_group),
+    effect_direction = "max_group_minus_min_group",
+    log2fc_max_vs_min = signed_log2fc,
+    # Backward-compatible alias used by the existing pathway mapping scripts.
     signed_log2fc = signed_log2fc,
     statistic = signed_log2fc,
     stringsAsFactors = FALSE

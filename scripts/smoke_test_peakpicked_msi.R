@@ -9,7 +9,8 @@
 # input_csv <- "path/to/your_data.csv"
 # source("scripts/smoke_test_peakpicked_msi.R")
 
-source("R/msi_pipeline.R")
+source("scripts/_bootstrap.R")
+load_spatialomics_code()
 
 args <- commandArgs(trailingOnly = TRUE)
 if (!exists("input_csv", inherits = TRUE) || !nzchar(input_csv)) {

@@ -511,6 +511,101 @@ compute_morans_i_grid <- function(values,
     n_effective = n_effective, n_isolated = n_isolated, n_edges = n_edges)
 }
 
+compute_gearys_c_grid <- function(values,
+                                  x = NULL,
+                                  y = NULL,
+                                  n_perm = 0,
+                                  alternative = c("less", "greater", "two.sided"),
+                                  seed = NULL,
+                                  neighbors = NULL,
+                                  neighbor_method = c("rook", "queen", "distance"),
+                                  distance_threshold = NULL,
+                                  weights = "binary",
+                                  symmetric = TRUE) {
+  alternative <- match.arg(alternative)
+  neighbor_method <- match.arg(neighbor_method)
+  if (length(n_perm) != 1L || !is.finite(n_perm) || n_perm < 0 || n_perm != as.integer(n_perm)) {
+    stop("n_perm must be one non-negative integer.", call. = FALSE)
+  }
+  n_perm <- as.integer(n_perm)
+  values <- as.numeric(values)
+  if (is.null(neighbors)) {
+    if (is.null(x) || is.null(y)) stop("x and y are required when neighbors is NULL.", call. = FALSE)
+    neighbors <- build_spatial_neighbors(
+      x, y, method = neighbor_method, distance_threshold = distance_threshold,
+      weights = weights, symmetric = symmetric
+    )
+  }
+  if (!inherits(neighbors, "spatial_neighbors")) {
+    stop("neighbors must come from build_spatial_neighbors().", call. = FALSE)
+  }
+  n_total <- length(values)
+  if (n_total != length(neighbors$x)) {
+    stop("values must contain one value per spatial-neighbor node.", call. = FALSE)
+  }
+  edges <- neighbors$undirected_edges
+  finite <- is.finite(values)
+  if (nrow(edges)) {
+    edges <- edges[finite[edges$from] & finite[edges$to], , drop = FALSE]
+  }
+  if (any(!is.finite(edges$weight)) || any(edges$weight < 0)) {
+    stop("Spatial neighbor weights must be finite and non-negative.", call. = FALSE)
+  }
+  degree <- tabulate(c(edges$from, edges$to), nbins = n_total)
+  effective <- finite & degree > 0L
+  n_effective <- sum(effective)
+  n_isolated <- n_total - n_effective
+  n_edges <- nrow(edges)
+  if (!n_edges || sum(edges$weight) <= 0) {
+    stop("Geary's C is undefined because the effective graph has no positive-weight edges.", call. = FALSE)
+  }
+  if (n_effective < 3L) {
+    stop("Geary's C requires at least three non-isolated finite nodes.", call. = FALSE)
+  }
+  index_map <- integer(n_total)
+  index_map[effective] <- seq_len(n_effective)
+  edge_i <- index_map[edges$from]
+  edge_j <- index_map[edges$to]
+  edge_weight <- edges$weight
+  effective_values <- values[effective]
+
+  geary_stat <- function(v) {
+    centered <- v - mean(v)
+    denominator <- sum(centered^2)
+    if (!is.finite(denominator) || denominator == 0) return(NA_real_)
+    numerator <- sum(edge_weight * (v[edge_i] - v[edge_j])^2)
+    ((n_effective - 1) / (2 * sum(edge_weight))) * numerator / denominator
+  }
+  observed <- geary_stat(effective_values)
+  p_value <- NA_real_
+  if (n_perm > 0L && is.finite(observed)) {
+    if (!is.null(seed)) set.seed(seed)
+    permuted <- replicate(
+      n_perm,
+      geary_stat(sample(effective_values, n_effective, replace = FALSE))
+    )
+    finite_permuted <- permuted[is.finite(permuted)]
+    if (!length(finite_permuted)) {
+      p_value <- NA_real_
+    } else if (alternative == "less") {
+      p_value <- (sum(finite_permuted <= observed) + 1) / (length(finite_permuted) + 1)
+    } else if (alternative == "greater") {
+      p_value <- (sum(finite_permuted >= observed) + 1) / (length(finite_permuted) + 1)
+    } else {
+      # Under random labeling, the exact randomization expectation of global
+      # Geary's C is one for a fixed symmetric graph.
+      p_value <- (sum(abs(finite_permuted - 1) >= abs(observed - 1)) + 1) /
+        (length(finite_permuted) + 1)
+    }
+  }
+  list(
+    C = observed, expected_C = 1, p_value = p_value,
+    alternative = alternative, n = n_effective, n_total = n_total,
+    n_effective = n_effective, n_isolated = n_isolated, n_edges = n_edges,
+    weight_sum_undirected = sum(edge_weight)
+  )
+}
+
 compare_contamination_methods <- function(pixel_matrix,
                                           fcols = feature_columns(pixel_matrix),
                                           x_col = "x",
@@ -2124,6 +2219,461 @@ cluster_pixels <- function(pixel_matrix,
   list(matrix = out, fit = fit, pca = pca, pca_components = if (is.null(pca)) 0 else ncol(matrix_data))
 }
 
+# Compute the H0 (mean-neighborhood) feature block used by the
+# BANKSY-inspired clustering helper below. This is not the full BANKSY
+# representation: no azimuthal Gabor feature (AGF) block is computed here.
+compute_neighborhood_average <- function(feature_matrix,
+                                         neighbors,
+                                         isolate_action = c("self", "error")) {
+  isolate_action <- match.arg(isolate_action)
+  if (!inherits(neighbors, "spatial_neighbors")) {
+    stop("neighbors must come from build_spatial_neighbors().", call. = FALSE)
+  }
+  feature_matrix <- as.matrix(feature_matrix)
+  storage.mode(feature_matrix) <- "double"
+  n_nodes <- nrow(feature_matrix)
+  if (n_nodes != length(neighbors$x)) {
+    stop("feature_matrix must have one row per spatial-neighbor node.", call. = FALSE)
+  }
+  if (!ncol(feature_matrix)) {
+    stop("feature_matrix must contain at least one feature.", call. = FALSE)
+  }
+  if (any(!is.finite(feature_matrix))) {
+    stop("feature_matrix must contain only finite values.", call. = FALSE)
+  }
+
+  edges <- neighbors$edges
+  if (!nrow(edges)) {
+    stop("Spatial neighbor graph has no directed edges.", call. = FALSE)
+  }
+  if (!isTRUE(neighbors$symmetric)) {
+    stop("Neighborhood averaging requires a symmetric neighbor graph.", call. = FALSE)
+  }
+  if (any(!is.finite(edges$weight)) || any(edges$weight < 0)) {
+    stop("Spatial neighbor weights must be finite and non-negative.", call. = FALSE)
+  }
+
+  neighbor_sum <- matrix(0, nrow = n_nodes, ncol = ncol(feature_matrix))
+  weight_sum <- numeric(n_nodes)
+  weighted_values <- feature_matrix[edges$to, , drop = FALSE] * edges$weight
+  grouped_values <- rowsum(weighted_values, group = edges$from, reorder = FALSE)
+  grouped_weights <- rowsum(matrix(edges$weight, ncol = 1L), group = edges$from, reorder = FALSE)
+  grouped_nodes <- as.integer(rownames(grouped_values))
+  neighbor_sum[grouped_nodes, ] <- grouped_values
+  weight_sum[grouped_nodes] <- grouped_weights[, 1]
+  isolated <- weight_sum <= 0
+  if (any(isolated) && isolate_action == "error") {
+    stop(sum(isolated), " spatial node(s) have no positive-weight neighbors.", call. = FALSE)
+  }
+  connected <- !isolated
+  neighbor_sum[connected, ] <- neighbor_sum[connected, , drop = FALSE] / weight_sum[connected]
+  if (any(isolated)) {
+    neighbor_sum[isolated, ] <- feature_matrix[isolated, , drop = FALSE]
+  }
+  dimnames(neighbor_sum) <- dimnames(feature_matrix)
+  attr(neighbor_sum, "isolated") <- isolated
+  neighbor_sum
+}
+
+scale_feature_block <- function(values) {
+  scaled <- scale(values, center = TRUE, scale = TRUE)
+  scaled[!is.finite(scaled)] <- 0
+  unname(scaled)
+}
+
+# BANKSY-inspired H0-only spatial feature augmentation. It concatenates
+# z-scaled own and mean-neighborhood features with sqrt(1-lambda) and
+# sqrt(lambda) weights. Unlike full BANKSY, this helper does not compute AGF,
+# does not construct the paper's default kNN Gaussian kernel, and uses k-means
+# rather than Leiden community detection.
+cluster_pixels_spatial <- function(pixel_matrix,
+                                   k = 3,
+                                   lambda = 0.5,
+                                   neighbor_method = c("queen", "rook", "distance"),
+                                   distance_threshold = NULL,
+                                   neighbors = NULL,
+                                   isolate_action = c("self", "error"),
+                                   pca_components = NULL,
+                                   nstart = 25,
+                                   iter.max = 100,
+                                   algorithm = "Lloyd",
+                                   seed = 1) {
+  neighbor_method <- match.arg(neighbor_method)
+  isolate_action <- match.arg(isolate_action)
+  if (length(lambda) != 1L || !is.finite(lambda) || lambda < 0 || lambda > 1) {
+    stop("lambda must be one finite value between 0 and 1.", call. = FALSE)
+  }
+  required_columns(pixel_matrix, c("x", "y"), "Pixel matrix")
+  if (nrow(pixel_matrix) < 2L) stop("At least two pixels are required for clustering.", call. = FALSE)
+  fcols <- feature_columns(pixel_matrix)
+  if (!length(fcols)) stop("No mz feature columns available for clustering.", call. = FALSE)
+  own_features <- as.matrix(pixel_matrix[fcols])
+  storage.mode(own_features) <- "double"
+  if (any(!is.finite(own_features))) {
+    stop("Feature values must be finite before spatial clustering.", call. = FALSE)
+  }
+
+  if (is.null(neighbors)) {
+    neighbors <- build_spatial_neighbors(
+      pixel_matrix$x, pixel_matrix$y,
+      method = neighbor_method,
+      distance_threshold = distance_threshold,
+      symmetric = TRUE
+    )
+  } else {
+    if (!inherits(neighbors, "spatial_neighbors")) {
+      stop("neighbors must come from build_spatial_neighbors().", call. = FALSE)
+    }
+    if (!isTRUE(all.equal(as.numeric(pixel_matrix$x), neighbors$x)) ||
+        !isTRUE(all.equal(as.numeric(pixel_matrix$y), neighbors$y))) {
+      stop("neighbors coordinates and pixel_matrix row order do not match.", call. = FALSE)
+    }
+  }
+
+  neighbor_features <- compute_neighborhood_average(
+    own_features, neighbors, isolate_action = isolate_action
+  )
+  own_scaled <- scale_feature_block(own_features)
+  neighbor_scaled <- scale_feature_block(neighbor_features)
+  augmented <- cbind(
+    sqrt(1 - lambda) * own_scaled,
+    sqrt(lambda) * neighbor_scaled
+  )
+  colnames(augmented) <- c(paste0("own__", fcols), paste0("neighbor__", fcols))
+
+  matrix_data <- augmented
+  pca <- NULL
+  if (!is.null(pca_components) && length(pca_components) == 1L &&
+      is.finite(pca_components) && pca_components > 0) {
+    n_components <- min(as.integer(pca_components), ncol(matrix_data), nrow(matrix_data) - 1L)
+    if (n_components >= 1L) {
+      pca <- stats::prcomp(matrix_data, center = TRUE, scale. = FALSE, rank. = n_components)
+      matrix_data <- pca$x[, seq_len(n_components), drop = FALSE]
+    }
+  }
+
+  k <- as.integer(k)
+  if (length(k) != 1L || is.na(k) || k < 2L || k > nrow(pixel_matrix)) {
+    stop("k must be an integer from 2 through the number of pixels.", call. = FALSE)
+  }
+  if (!is.null(seed)) set.seed(seed)
+  fit <- stats::kmeans(
+    matrix_data, centers = k, nstart = nstart, iter.max = iter.max,
+    algorithm = algorithm
+  )
+  out <- pixel_matrix
+  out$cluster <- fit$cluster
+  list(
+    matrix = out,
+    fit = fit,
+    pca = pca,
+    neighbors = neighbors,
+    neighborhood_features = neighbor_features,
+    augmented_features = augmented,
+    lambda = lambda,
+    neighbor_method = neighbors$method,
+    isolate_action = isolate_action,
+    n_isolated = sum(attr(neighbor_features, "isolated")),
+    pca_components = if (is.null(pca)) 0L else ncol(matrix_data),
+    method = "BANKSY-inspired H0-only spatial augmentation followed by k-means",
+    full_banksy = FALSE
+  )
+}
+
+cluster_diagnostics_spatial <- function(pixel_matrix,
+                                        k = 3,
+                                        lambda_grid = seq(0, 1, by = 0.25),
+                                        neighbor_method = c("queen", "rook", "distance"),
+                                        distance_threshold = NULL,
+                                        isolate_action = c("self", "error"),
+                                        pca_components = NULL,
+                                        nstart = 25,
+                                        iter.max = 100,
+                                        algorithm = "Lloyd",
+                                        seed = 1) {
+  neighbor_method <- match.arg(neighbor_method)
+  isolate_action <- match.arg(isolate_action)
+  if (!length(lambda_grid) || any(!is.finite(lambda_grid)) || any(lambda_grid < 0 | lambda_grid > 1)) {
+    stop("lambda_grid must contain finite values between 0 and 1.", call. = FALSE)
+  }
+  neighbors <- build_spatial_neighbors(
+    pixel_matrix$x, pixel_matrix$y, method = neighbor_method,
+    distance_threshold = distance_threshold, symmetric = TRUE
+  )
+  edges <- neighbors$undirected_edges
+  if (!nrow(edges)) stop("Spatial neighbor graph has no edges.", call. = FALSE)
+
+  rows <- lapply(lambda_grid, function(lambda) {
+    result <- cluster_pixels_spatial(
+      pixel_matrix, k = k, lambda = lambda, neighbors = neighbors,
+      isolate_action = isolate_action, pca_components = pca_components,
+      nstart = nstart, iter.max = iter.max, algorithm = algorithm, seed = seed
+    )
+    labels <- result$matrix$cluster
+    same_cluster <- labels[edges$from] == labels[edges$to]
+    data.frame(
+      lambda = lambda,
+      k = k,
+      tot_withinss = result$fit$tot.withinss,
+      adjacent_pair_agreement = mean(same_cluster),
+      boundary_edge_fraction = mean(!same_cluster),
+      n_edges_undirected = nrow(edges),
+      n_isolated = result$n_isolated,
+      stringsAsFactors = FALSE
+    )
+  })
+  output <- do.call(rbind, rows)
+  attr(output, "interpretation") <- paste(
+    "Adjacent-pair agreement is descriptive and generally favors smoother",
+    "solutions; it is not an accuracy metric and should not select lambda alone."
+  )
+  output
+}
+
+# Gaussian/Potts-inspired spatially regularized k-means optimized by
+# sequential iterated conditional modes (ICM). This is a deterministic local
+# optimizer for the stated objective, not full Bayesian HMRF inference.
+cluster_pixels_hmrf <- function(pixel_matrix,
+                                k = 3,
+                                beta = 1,
+                                neighbor_method = c("queen", "rook", "distance"),
+                                distance_threshold = NULL,
+                                neighbors = NULL,
+                                scale_features = TRUE,
+                                data_term_scale = c("per_feature", "raw"),
+                                pca_components = NULL,
+                                max_iter = 20,
+                                update_order = c("random", "fixed"),
+                                init_nstart = 25,
+                                init_iter_max = 100,
+                                init_algorithm = "Lloyd",
+                                seed = 1,
+                                energy_tolerance = 1e-10) {
+  neighbor_method <- match.arg(neighbor_method)
+  data_term_scale <- match.arg(data_term_scale)
+  update_order <- match.arg(update_order)
+  if (length(beta) != 1L || !is.finite(beta) || beta < 0) {
+    stop("beta must be one finite non-negative value.", call. = FALSE)
+  }
+  if (length(max_iter) != 1L || !is.finite(max_iter) || max_iter < 1) {
+    stop("max_iter must be one positive integer.", call. = FALSE)
+  }
+  max_iter <- as.integer(max_iter)
+  if (length(energy_tolerance) != 1L || !is.finite(energy_tolerance) || energy_tolerance < 0) {
+    stop("energy_tolerance must be one finite non-negative value.", call. = FALSE)
+  }
+  required_columns(pixel_matrix, c("x", "y"), "Pixel matrix")
+  if (nrow(pixel_matrix) < 2L) stop("At least two pixels are required for clustering.", call. = FALSE)
+  fcols <- feature_columns(pixel_matrix)
+  if (!length(fcols)) stop("No mz feature columns available for clustering.", call. = FALSE)
+  matrix_data <- as.matrix(pixel_matrix[fcols])
+  storage.mode(matrix_data) <- "double"
+  if (any(!is.finite(matrix_data))) {
+    stop("Feature values must be finite before HMRF/Potts clustering.", call. = FALSE)
+  }
+  if (isTRUE(scale_features)) matrix_data <- scale_feature_block(matrix_data)
+
+  pca <- NULL
+  if (!is.null(pca_components) && length(pca_components) == 1L &&
+      is.finite(pca_components) && pca_components > 0) {
+    n_components <- min(as.integer(pca_components), ncol(matrix_data), nrow(matrix_data) - 1L)
+    if (n_components >= 1L) {
+      pca <- stats::prcomp(matrix_data, center = TRUE, scale. = FALSE, rank. = n_components)
+      matrix_data <- pca$x[, seq_len(n_components), drop = FALSE]
+    }
+  }
+  n <- nrow(matrix_data)
+  k <- as.integer(k)
+  if (length(k) != 1L || is.na(k) || k < 2L || k > n) {
+    stop("k must be an integer from 2 through the number of pixels.", call. = FALSE)
+  }
+
+  if (is.null(neighbors)) {
+    neighbors <- build_spatial_neighbors(
+      pixel_matrix$x, pixel_matrix$y, method = neighbor_method,
+      distance_threshold = distance_threshold, symmetric = TRUE
+    )
+  } else {
+    if (!inherits(neighbors, "spatial_neighbors")) {
+      stop("neighbors must come from build_spatial_neighbors().", call. = FALSE)
+    }
+    if (!isTRUE(neighbors$symmetric)) stop("HMRF/Potts clustering requires a symmetric graph.", call. = FALSE)
+    if (!isTRUE(all.equal(as.numeric(pixel_matrix$x), neighbors$x)) ||
+        !isTRUE(all.equal(as.numeric(pixel_matrix$y), neighbors$y))) {
+      stop("neighbors coordinates and pixel_matrix row order do not match.", call. = FALSE)
+    }
+  }
+  edges <- neighbors$edges
+  undirected_edges <- neighbors$undirected_edges
+  if (!nrow(undirected_edges)) stop("Spatial neighbor graph has no edges.", call. = FALSE)
+  if (any(!is.finite(edges$weight)) || any(edges$weight < 0)) {
+    stop("Spatial neighbor weights must be finite and non-negative.", call. = FALSE)
+  }
+  adjacency_to <- split(edges$to, factor(edges$from, levels = seq_len(n)))
+  adjacency_weight <- split(edges$weight, factor(edges$from, levels = seq_len(n)))
+  data_divisor <- if (data_term_scale == "per_feature") ncol(matrix_data) else 1
+
+  if (!is.null(seed)) set.seed(seed)
+  init_fit <- stats::kmeans(
+    matrix_data, centers = k, nstart = init_nstart,
+    iter.max = init_iter_max, algorithm = init_algorithm
+  )
+  labels <- init_fit$cluster
+  centers <- init_fit$centers
+
+  objective_parts <- function(current_labels, current_centers) {
+    residual <- matrix_data - current_centers[current_labels, , drop = FALSE]
+    data_energy <- sum(residual^2) / data_divisor
+    spatial_energy <- beta * sum(
+      undirected_edges$weight *
+        (current_labels[undirected_edges$from] != current_labels[undirected_edges$to])
+    )
+    c(data_energy = data_energy, spatial_energy = spatial_energy,
+      total_energy = data_energy + spatial_energy)
+  }
+  initial_energy <- objective_parts(labels, centers)
+  iteration_log <- data.frame(
+    iteration = 0L, n_changed = NA_integer_,
+    data_energy = initial_energy[["data_energy"]],
+    spatial_energy = initial_energy[["spatial_energy"]],
+    total_energy = initial_energy[["total_energy"]],
+    stringsAsFactors = FALSE
+  )
+  converged <- FALSE
+
+  for (iteration in seq_len(max_iter)) {
+    previous_labels <- labels
+    node_order <- if (update_order == "random") sample.int(n) else seq_len(n)
+    class_sizes <- tabulate(labels, nbins = k)
+    for (node in node_order) {
+      current_class <- labels[node]
+      data_energy <- rowSums(
+        sweep(centers, 2, matrix_data[node, ], "-")^2
+      ) / data_divisor
+      neighbor_nodes <- adjacency_to[[node]]
+      neighbor_weights <- adjacency_weight[[node]]
+      same_weight <- numeric(k)
+      if (length(neighbor_nodes)) {
+        same_weight <- vapply(seq_len(k), function(class_id) {
+          sum(neighbor_weights[labels[neighbor_nodes] == class_id])
+        }, numeric(1))
+      }
+      conditional_energy <- data_energy - beta * same_weight
+      minimum <- min(conditional_energy)
+      candidates <- which(abs(conditional_energy - minimum) <= energy_tolerance)
+      proposed <- if (current_class %in% candidates) current_class else candidates[1L]
+      # Preserve all k states; an empty Gaussian component has no defined mean.
+      if (proposed != current_class && class_sizes[current_class] > 1L) {
+        labels[node] <- proposed
+        class_sizes[current_class] <- class_sizes[current_class] - 1L
+        class_sizes[proposed] <- class_sizes[proposed] + 1L
+      }
+    }
+
+    centers <- t(vapply(seq_len(k), function(class_id) {
+      colMeans(matrix_data[labels == class_id, , drop = FALSE])
+    }, numeric(ncol(matrix_data))))
+    energy <- objective_parts(labels, centers)
+    n_changed <- sum(labels != previous_labels)
+    iteration_log <- rbind(iteration_log, data.frame(
+      iteration = iteration, n_changed = n_changed,
+      data_energy = energy[["data_energy"]],
+      spatial_energy = energy[["spatial_energy"]],
+      total_energy = energy[["total_energy"]],
+      stringsAsFactors = FALSE
+    ))
+    previous_energy <- iteration_log$total_energy[nrow(iteration_log) - 1L]
+    audit_tolerance <- energy_tolerance * max(1, abs(previous_energy))
+    if (energy[["total_energy"]] > previous_energy + audit_tolerance) {
+      stop("Internal error: sequential ICM increased the Potts objective.", call. = FALSE)
+    }
+    if (n_changed == 0L) {
+      converged <- TRUE
+      break
+    }
+  }
+
+  withinss <- vapply(seq_len(k), function(class_id) {
+    members <- matrix_data[labels == class_id, , drop = FALSE]
+    sum(sweep(members, 2, centers[class_id, ], "-")^2)
+  }, numeric(1))
+  totss <- sum(scale(matrix_data, center = TRUE, scale = FALSE)^2)
+  fit <- list(
+    cluster = labels, centers = centers, totss = totss,
+    withinss = withinss, tot.withinss = sum(withinss),
+    betweenss = totss - sum(withinss), size = tabulate(labels, nbins = k),
+    iter = max(iteration_log$iteration), ifault = if (converged) 0L else 2L
+  )
+  out <- pixel_matrix
+  out$cluster <- labels
+  list(
+    matrix = out, labels = labels, centers = centers, fit = fit,
+    beta = beta, neighbor_method = neighbors$method, neighbors = neighbors,
+    iteration_log = iteration_log, converged = converged,
+    update_order = update_order, scale_features = isTRUE(scale_features),
+    data_term_scale = data_term_scale, pca = pca,
+    pca_components = if (is.null(pca)) 0L else ncol(matrix_data),
+    method = "Gaussian/Potts-inspired spatially regularized k-means with sequential ICM",
+    full_bayesian_hmrf = FALSE
+  )
+}
+
+cluster_diagnostics_hmrf <- function(pixel_matrix,
+                                     k = 3,
+                                     beta_grid = c(0, 0.5, 1, 2, 4),
+                                     neighbor_method = c("queen", "rook", "distance"),
+                                     distance_threshold = NULL,
+                                     scale_features = TRUE,
+                                     data_term_scale = c("per_feature", "raw"),
+                                     pca_components = NULL,
+                                     max_iter = 20,
+                                     update_order = c("random", "fixed"),
+                                     seed = 1) {
+  neighbor_method <- match.arg(neighbor_method)
+  data_term_scale <- match.arg(data_term_scale)
+  update_order <- match.arg(update_order)
+  if (!length(beta_grid) || any(!is.finite(beta_grid)) || any(beta_grid < 0)) {
+    stop("beta_grid must contain finite non-negative values.", call. = FALSE)
+  }
+  required_columns(pixel_matrix, c("x", "y"), "Pixel matrix")
+  neighbors <- build_spatial_neighbors(
+    pixel_matrix$x, pixel_matrix$y, method = neighbor_method,
+    distance_threshold = distance_threshold, symmetric = TRUE
+  )
+  edges <- neighbors$undirected_edges
+  if (!nrow(edges)) stop("Spatial neighbor graph has no edges.", call. = FALSE)
+  rows <- lapply(beta_grid, function(beta) {
+    result <- cluster_pixels_hmrf(
+      pixel_matrix, k = k, beta = beta, neighbors = neighbors,
+      scale_features = scale_features, data_term_scale = data_term_scale,
+      pca_components = pca_components, max_iter = max_iter,
+      update_order = update_order, seed = seed
+    )
+    labels <- result$labels
+    same_cluster <- labels[edges$from] == labels[edges$to]
+    final <- result$iteration_log[nrow(result$iteration_log), , drop = FALSE]
+    data.frame(
+      beta = beta, k = k,
+      data_energy = final$data_energy,
+      spatial_energy = final$spatial_energy,
+      total_energy = final$total_energy,
+      tot_withinss = result$fit$tot.withinss,
+      n_iterations = final$iteration,
+      converged = result$converged,
+      adjacent_pair_agreement = mean(same_cluster),
+      boundary_edge_fraction = mean(!same_cluster),
+      n_edges_undirected = nrow(edges),
+      stringsAsFactors = FALSE
+    )
+  })
+  output <- do.call(rbind, rows)
+  attr(output, "interpretation") <- paste(
+    "Beta is scale-dependent. Adjacent-pair agreement measures smoothness,",
+    "not accuracy, and must not be the sole beta-selection criterion."
+  )
+  output
+}
+
 cluster_diagnostics <- function(pixel_matrix,
                                 max_k = 10,
                                 pca_components = NULL,
@@ -2179,6 +2729,191 @@ cluster_diagnostics <- function(pixel_matrix,
     )
   })
   do.call(rbind, rows)
+}
+
+compute_neighborhood_composition <- function(cell_type_labels,
+                                             x,
+                                             y,
+                                             k = 10,
+                                             cell_types = NULL,
+                                             pixel_id = seq_along(cell_type_labels),
+                                             region_id = rep("region_1", length(cell_type_labels)),
+                                             include_self = TRUE) {
+  n <- length(cell_type_labels)
+  if (n == 0L || length(x) != n || length(y) != n ||
+      length(pixel_id) != n || length(region_id) != n) {
+    stop(
+      "cell_type_labels, x, y, pixel_id, and region_id must have the same non-zero length.",
+      call. = FALSE
+    )
+  }
+  if (anyNA(cell_type_labels) || any(!nzchar(as.character(cell_type_labels)))) {
+    stop("cell_type_labels must not contain missing or empty values.", call. = FALSE)
+  }
+  if (!is.numeric(x) || !is.numeric(y) || any(!is.finite(x)) || any(!is.finite(y))) {
+    stop("x and y must contain only finite numeric coordinates.", call. = FALSE)
+  }
+  if (anyNA(pixel_id) || anyDuplicated(pixel_id)) {
+    stop("pixel_id must be non-missing and unique.", call. = FALSE)
+  }
+  if (anyNA(region_id) || any(!nzchar(as.character(region_id)))) {
+    stop("region_id must not contain missing or empty values.", call. = FALSE)
+  }
+  if (length(k) != 1L || !is.finite(k) || k < 1 || k != as.integer(k)) {
+    stop("k must be one positive integer.", call. = FALSE)
+  }
+  if (length(include_self) != 1L || is.na(include_self)) {
+    stop("include_self must be TRUE or FALSE.", call. = FALSE)
+  }
+  k <- as.integer(k)
+  labels <- as.character(cell_type_labels)
+  if (is.null(cell_types)) {
+    cell_types <- sort(unique(labels))
+  } else {
+    cell_types <- as.character(cell_types)
+    if (anyNA(cell_types) || any(!nzchar(cell_types)) || anyDuplicated(cell_types)) {
+      stop("cell_types must contain unique, non-missing, non-empty labels.", call. = FALSE)
+    }
+    missing_types <- setdiff(unique(labels), cell_types)
+    if (length(missing_types) > 0L) {
+      stop("cell_types is missing observed label(s): ", paste(missing_types, collapse = ", "), call. = FALSE)
+    }
+  }
+
+  region <- as.character(region_id)
+  region_sizes <- table(region)
+  minimum_size <- k + if (isTRUE(include_self)) 0L else 1L
+  too_small <- names(region_sizes)[region_sizes < minimum_size]
+  if (length(too_small) > 0L) {
+    stop(
+      "Each region must contain at least ", minimum_size,
+      " positions for this k/include_self setting. Too small: ",
+      paste(too_small, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  safe_type_names <- make.unique(make.names(cell_types))
+  composition_columns <- paste0("composition__", safe_type_names)
+  count_matrix <- matrix(0L, nrow = n, ncol = length(cell_types))
+  colnames(count_matrix) <- composition_columns
+  neighbor_indices <- matrix(NA_integer_, nrow = n, ncol = k)
+  x_numeric <- as.numeric(x)
+  y_numeric <- as.numeric(y)
+
+  for (region_name in unique(region)) {
+    region_indices <- which(region == region_name)
+    for (i in region_indices) {
+      candidates <- setdiff(region_indices, i)
+      distance_squared <- (x_numeric[candidates] - x_numeric[i])^2 +
+        (y_numeric[candidates] - y_numeric[i])^2
+      ordered_candidates <- candidates[order(distance_squared, candidates)]
+      selected <- if (isTRUE(include_self)) {
+        c(i, ordered_candidates[seq_len(k - 1L)])
+      } else {
+        ordered_candidates[seq_len(k)]
+      }
+      neighbor_indices[i, ] <- selected
+      count_matrix[i, ] <- tabulate(match(labels[selected], cell_types), nbins = length(cell_types))
+    }
+  }
+
+  composition_matrix <- count_matrix / k
+  matrix_output <- data.frame(
+    pixel_id = pixel_id,
+    region_id = region,
+    focal_cell_type = labels,
+    window_size = rep(k, n),
+    composition_matrix,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+  mapping <- data.frame(
+    cell_type = cell_types,
+    composition_column = composition_columns,
+    stringsAsFactors = FALSE
+  )
+  structure(
+    list(
+      matrix = matrix_output,
+      counts = count_matrix,
+      neighbor_indices = neighbor_indices,
+      cell_type_mapping = mapping,
+      settings = list(k = k, include_self = isTRUE(include_self), region_column = "region_id")
+    ),
+    class = "neighborhood_composition"
+  )
+}
+
+define_niches <- function(composition,
+                          k_niches,
+                          nstart = 25,
+                          iter.max = 100,
+                          algorithm = "Lloyd",
+                          seed = 1) {
+  if (inherits(composition, "neighborhood_composition")) {
+    composition_matrix <- composition$matrix
+    composition_columns <- composition$cell_type_mapping$composition_column
+  } else if (is.data.frame(composition)) {
+    composition_matrix <- composition
+    composition_columns <- grep("^composition__", names(composition_matrix), value = TRUE)
+  } else {
+    stop("composition must come from compute_neighborhood_composition() or be a data frame.", call. = FALSE)
+  }
+  if (length(composition_columns) == 0L ||
+      any(!composition_columns %in% names(composition_matrix))) {
+    stop("No valid composition__ columns were found.", call. = FALSE)
+  }
+  values <- as.matrix(composition_matrix[, composition_columns, drop = FALSE])
+  storage.mode(values) <- "double"
+  if (nrow(values) < 2L || any(!is.finite(values)) || any(values < 0)) {
+    stop("Composition values must be a finite, non-negative matrix with at least two rows.", call. = FALSE)
+  }
+  row_totals <- rowSums(values)
+  if (any(abs(row_totals - 1) > sqrt(.Machine$double.eps))) {
+    stop("Each neighborhood composition row must sum to one.", call. = FALSE)
+  }
+  if (length(k_niches) != 1L || !is.finite(k_niches) ||
+      k_niches < 2 || k_niches != as.integer(k_niches)) {
+    stop("k_niches must be one integer of at least two.", call. = FALSE)
+  }
+  k_niches <- as.integer(k_niches)
+  unique_profiles <- nrow(unique(as.data.frame(values, check.names = FALSE)))
+  if (k_niches > unique_profiles) {
+    stop(
+      "k_niches cannot exceed the number of distinct composition profiles (",
+      unique_profiles, ").",
+      call. = FALSE
+    )
+  }
+  if (!is.null(seed)) set.seed(seed)
+  fit <- stats::kmeans(
+    values,
+    centers = k_niches,
+    nstart = nstart,
+    iter.max = iter.max,
+    algorithm = algorithm
+  )
+  output <- composition_matrix
+  output$niche_id <- as.integer(fit$cluster)
+  output$niche_label <- paste0("niche_", fit$cluster)
+  list(
+    matrix = output,
+    fit = fit,
+    centers = fit$centers,
+    composition_columns = composition_columns,
+    settings = list(
+      k_niches = k_niches,
+      nstart = nstart,
+      iter.max = iter.max,
+      algorithm = algorithm,
+      seed = seed
+    ),
+    interpretation = paste(
+      "Niche numbers are arbitrary k-means labels, not ordered biological identities;",
+      "annotate them from their cell-type composition centers."
+    )
+  )
 }
 
 define_rois <- function(pixel_matrix,
@@ -2708,6 +3443,318 @@ differential_region_analysis <- function(sample_matrix,
   result[order(result$fdr, -abs(result$effect_size), na.last = TRUE), , drop = FALSE]
 }
 
+differential_region_analysis_wilcoxon <- function(
+    sample_matrix,
+    group_column = "roi_id",
+    subject_column = NULL,
+    section_column = NULL,
+    reference_group = NULL,
+    aggregate_fun = c("mean", "median"),
+    exact_method = c("auto", "exact", "asymptotic"),
+    min_replicates = 5L,
+    confidence_level = 0.95,
+    p_adjust_method = "BH") {
+  aggregate_fun <- match.arg(aggregate_fun)
+  exact_method <- match.arg(exact_method)
+  required_columns(sample_matrix, c("sample_id", group_column), "Sample matrix")
+  fcols <- feature_columns(sample_matrix)
+  if (!length(fcols)) {
+    stop("No mz_ feature columns found in sample_matrix.", call. = FALSE)
+  }
+  if (any(!vapply(sample_matrix[fcols], is.numeric, logical(1)))) {
+    stop("All mz_ feature columns must be numeric.", call. = FALSE)
+  }
+  if (length(min_replicates) != 1L || !is.finite(min_replicates) ||
+      min_replicates < 3L || min_replicates != as.integer(min_replicates)) {
+    stop("min_replicates must be one integer of at least three.", call. = FALSE)
+  }
+  min_replicates <- as.integer(min_replicates)
+  if (length(confidence_level) != 1L || !is.finite(confidence_level) ||
+      confidence_level <= 0 || confidence_level >= 1) {
+    stop("confidence_level must lie strictly between zero and one.", call. = FALSE)
+  }
+  optional_columns <- c(subject_column, section_column)
+  optional_columns <- optional_columns[!is.na(optional_columns) & nzchar(optional_columns)]
+  required_columns(sample_matrix, optional_columns, "Sample matrix")
+
+  groups <- sort(unique(as.character(sample_matrix[[group_column]])))
+  groups <- groups[!is.na(groups) & nzchar(groups)]
+  if (length(groups) < 2L) {
+    stop("At least two non-empty regions are required for differential analysis.", call. = FALSE)
+  }
+  if (!is.null(reference_group)) {
+    reference_group <- as.character(reference_group)[1]
+    if (!reference_group %in% groups) {
+      stop("reference_group is not present in ", group_column, ".", call. = FALSE)
+    }
+    comparison_groups <- setdiff(groups, reference_group)
+    comparisons <- rbind(rep(reference_group, length(comparison_groups)), comparison_groups)
+  } else {
+    comparisons <- utils::combn(groups, 2L)
+  }
+
+  if (!is.null(subject_column)) {
+    replicate_column <- subject_column
+    inference_unit <- "biological_subject"
+    paired_design <- TRUE
+    pseudoreplication_warning <- FALSE
+  } else if (!is.null(section_column)) {
+    replicate_column <- section_column
+    inference_unit <- "section"
+    paired_design <- TRUE
+    pseudoreplication_warning <- TRUE
+    warning(
+      "No biological subject column was supplied. Wilcoxon results are aggregated by section ",
+      "and must not be described as independent biological replication.",
+      call. = FALSE
+    )
+  } else {
+    replicate_column <- "sample_id"
+    inference_unit <- "sample_or_tile"
+    paired_design <- FALSE
+    pseudoreplication_warning <- TRUE
+    warning(
+      "No biological subject or section column was supplied. Wilcoxon results treat sample ",
+      "rows as independent and may be pseudoreplicated; use them as exploratory only.",
+      call. = FALSE
+    )
+  }
+
+  work_columns <- unique(c(group_column, replicate_column, fcols))
+  work <- sample_matrix[, work_columns, drop = FALSE]
+  work[[group_column]] <- as.character(work[[group_column]])
+  work[[replicate_column]] <- as.character(work[[replicate_column]])
+  work <- work[
+    !is.na(work[[group_column]]) & nzchar(work[[group_column]]) &
+      !is.na(work[[replicate_column]]) & nzchar(work[[replicate_column]]),
+    , drop = FALSE
+  ]
+  if (!nrow(work)) {
+    stop("No rows remain after removing missing group or replicate identifiers.", call. = FALSE)
+  }
+  summarize_replicate <- switch(
+    aggregate_fun,
+    mean = function(x) {
+      x <- as.numeric(x)
+      if (all(!is.finite(x))) NA_real_ else mean(x[is.finite(x)])
+    },
+    median = function(x) {
+      x <- as.numeric(x)
+      if (all(!is.finite(x))) NA_real_ else stats::median(x[is.finite(x)])
+    }
+  )
+  aggregate_data <- work
+  aggregate_data$.__group__ <- aggregate_data[[group_column]]
+  aggregate_data$.__replicate__ <- aggregate_data[[replicate_column]]
+  aggregated <- stats::aggregate(
+    aggregate_data[, fcols, drop = FALSE],
+    by = list(
+      .__group__ = aggregate_data$.__group__,
+      .__replicate__ = aggregate_data$.__replicate__
+    ),
+    FUN = summarize_replicate
+  )
+
+  rows <- list()
+  row_index <- 1L
+  for (comparison_index in seq_len(ncol(comparisons))) {
+    group_a <- comparisons[1, comparison_index]
+    group_b <- comparisons[2, comparison_index]
+    left_rows <- aggregated$.__group__ == group_a
+    right_rows <- aggregated$.__group__ == group_b
+    left_ids <- as.character(aggregated$.__replicate__[left_rows])
+    right_ids <- as.character(aggregated$.__replicate__[right_rows])
+    shared_replicates <- sort(intersect(left_ids, right_ids))
+    contrast_eligible <- if (paired_design) {
+      length(shared_replicates) >= min_replicates
+    } else {
+      length(left_ids) >= min_replicates && length(right_ids) >= min_replicates
+    }
+    contrast_skip_reason <- if (contrast_eligible) {
+      NA_character_
+    } else if (paired_design) {
+      "too_few_shared_replicates"
+    } else {
+      "too_few_replicates_per_group"
+    }
+    pair_coverage <- if (paired_design) {
+      length(shared_replicates) / length(unique(c(left_ids, right_ids)))
+    } else {
+      NA_real_
+    }
+
+    for (feature in fcols) {
+      left <- as.numeric(aggregated[[feature]][left_rows])
+      right <- as.numeric(aggregated[[feature]][right_rows])
+      names(left) <- left_ids
+      names(right) <- right_ids
+      if (paired_design) {
+        left_test <- left[shared_replicates]
+        right_test <- right[shared_replicates]
+        complete <- is.finite(left_test) & is.finite(right_test)
+        left_test <- left_test[complete]
+        right_test <- right_test[complete]
+      } else {
+        left_test <- left[is.finite(left)]
+        right_test <- right[is.finite(right)]
+      }
+      differences <- if (paired_design) right_test - left_test else numeric()
+      n_zero_differences <- if (paired_design) sum(differences == 0) else NA_integer_
+      n_ties <- if (paired_design) {
+        sum(duplicated(abs(differences[differences != 0])))
+      } else {
+        sum(duplicated(c(left_test, right_test)))
+      }
+      enough_feature_data <- if (paired_design) {
+        length(left_test) >= min_replicates
+      } else {
+        length(left_test) >= min_replicates && length(right_test) >= min_replicates
+      }
+      nonzero_information <- if (paired_design) {
+        any(differences != 0)
+      } else {
+        length(unique(c(left_test, right_test))) > 1L
+      }
+      exact_eligible <- if (paired_design) {
+        length(differences) < 50L && n_zero_differences == 0L && n_ties == 0L
+      } else {
+        length(left_test) + length(right_test) < 50L && n_ties == 0L
+      }
+      use_exact <- switch(
+        exact_method,
+        auto = exact_eligible,
+        exact = exact_eligible,
+        asymptotic = FALSE
+      )
+      status <- "fitted"
+      skip_reason <- NA_character_
+      if (!contrast_eligible) {
+        status <- "skipped"
+        skip_reason <- contrast_skip_reason
+      } else if (!enough_feature_data) {
+        status <- "skipped"
+        skip_reason <- "feature_missingness_reduces_replication"
+      } else if (!nonzero_information) {
+        status <- "constant"
+        skip_reason <- "no_rank_information"
+      } else if (exact_method == "exact" && !exact_eligible) {
+        status <- "skipped"
+        skip_reason <- "exact_test_unavailable_with_ties_zeros_or_large_sample"
+      }
+
+      test <- NULL
+      warning_messages <- character()
+      if (status == "fitted") {
+        test <- withCallingHandlers(
+          tryCatch(
+            stats::wilcox.test(
+              right_test, left_test,
+              paired = paired_design,
+              exact = use_exact,
+              correct = !use_exact,
+              conf.int = TRUE,
+              conf.level = confidence_level
+            ),
+            error = function(error) error
+          ),
+          warning = function(warning) {
+            warning_messages <<- unique(c(warning_messages, conditionMessage(warning)))
+            invokeRestart("muffleWarning")
+          }
+        )
+        if (inherits(test, "error")) {
+          status <- "failed"
+          skip_reason <- conditionMessage(test)
+          test <- NULL
+        }
+      }
+      if (status == "constant") {
+        p_value <- 1
+        statistic <- 0
+      } else {
+        p_value <- if (is.null(test)) NA_real_ else unname(test$p.value)
+        statistic <- if (is.null(test)) NA_real_ else unname(test$statistic)
+      }
+      rank_biserial <- NA_real_
+      if (!is.null(test)) {
+        if (paired_design) {
+          nonzero <- differences[differences != 0]
+          ranks <- rank(abs(nonzero), ties.method = "average")
+          denominator <- sum(ranks)
+          rank_biserial <- if (denominator > 0) {
+            (sum(ranks[nonzero > 0]) - sum(ranks[nonzero < 0])) / denominator
+          } else NA_real_
+        } else {
+          rank_biserial <- 2 * statistic / (length(right_test) * length(left_test)) - 1
+        }
+      } else if (status == "constant") {
+        rank_biserial <- 0
+      }
+      estimate <- if (is.null(test) || is.null(test$estimate)) NA_real_ else unname(test$estimate[1])
+      confidence_interval <- if (is.null(test) || is.null(test$conf.int)) {
+        c(NA_real_, NA_real_)
+      } else {
+        unname(test$conf.int[1:2])
+      }
+      median_left <- if (length(left_test)) stats::median(left_test) else NA_real_
+      median_right <- if (length(right_test)) stats::median(right_test) else NA_real_
+
+      rows[[row_index]] <- data.frame(
+        feature = feature,
+        mz = suppressWarnings(as.numeric(sub("^mz_", "", feature))),
+        group_a = group_a,
+        group_b = group_b,
+        median_group_a = median_left,
+        median_group_b = median_right,
+        median_difference = median_right - median_left,
+        median_paired_difference = if (paired_design && length(differences)) stats::median(differences) else NA_real_,
+        hodges_lehmann_shift = estimate,
+        confidence_lower = confidence_interval[1],
+        confidence_upper = confidence_interval[2],
+        rank_biserial_correlation = rank_biserial,
+        statistic = statistic,
+        p_value = p_value,
+        n_group_a = length(left_test),
+        n_group_b = length(right_test),
+        n_pairs = if (paired_design) length(left_test) else NA_integer_,
+        n_shared_replicates_design = if (paired_design) length(shared_replicates) else NA_integer_,
+        pair_coverage = pair_coverage,
+        n_ties = n_ties,
+        n_zero_differences = n_zero_differences,
+        test_type = if (paired_design) "paired_wilcoxon_signed_rank" else "wilcoxon_rank_sum",
+        p_value_method = if (status %in% c("fitted", "constant")) {
+          if (use_exact) "exact" else "asymptotic"
+        } else NA_character_,
+        status = status,
+        skip_reason = skip_reason,
+        warning_message = paste(warning_messages, collapse = " | "),
+        inference_unit = inference_unit,
+        subject_column = if (is.null(subject_column)) NA_character_ else subject_column,
+        section_column = if (is.null(section_column)) NA_character_ else section_column,
+        aggregation = aggregate_fun,
+        pseudoreplication_warning = pseudoreplication_warning,
+        stringsAsFactors = FALSE
+      )
+      row_index <- row_index + 1L
+    }
+  }
+  result <- do.call(rbind, rows)
+  result$fdr <- stats::ave(
+    result$p_value,
+    interaction(result$group_a, result$group_b, drop = TRUE),
+    FUN = function(p) stats::p.adjust(p, method = p_adjust_method)
+  )
+  result$fdr_scope <- "within_contrast_across_features"
+  result <- result[order(result$fdr, -abs(result$rank_biserial_correlation), na.last = TRUE), , drop = FALSE]
+  rownames(result) <- NULL
+  attr(result, "interpretation") <- paste(
+    "Wilcoxon results are sensitivity analyses, not independent validation of parametric or spatial models.",
+    "median_difference is descriptive; rank_biserial_correlation is the rank-based effect size,",
+    "and hodges_lehmann_shift assumes a location-shift interpretation."
+  )
+  result
+}
+
 detect_metaboanalyst_result <- function(result_data) {
   columns <- names(result_data)
   if (all(c("Feature", "VIP") %in% columns)) return("vip")
@@ -3149,6 +4196,415 @@ compute_spatially_variable_metabolites <- function(pixel_matrix,
   result <- do.call(rbind, rows)
   result$adj_p_value <- stats::p.adjust(result$p_value, method = p_adjust_method)
   result[order(result$adj_p_value, -abs(result$morans_i)), , drop = FALSE]
+}
+
+compute_spatially_variable_metabolites_geary <- function(
+    pixel_matrix,
+    coordinates = NULL,
+    x_col = "x",
+    y_col = "y",
+    fcols = feature_columns(pixel_matrix),
+    n_perm = 199,
+    alternative = c("less", "greater", "two.sided"),
+    p_adjust_method = "BH",
+    seed = NULL,
+    neighbors = NULL,
+    neighbor_method = c("rook", "queen", "distance"),
+    distance_threshold = NULL,
+    weights = "binary",
+    symmetric = TRUE) {
+  alternative <- match.arg(alternative)
+  neighbor_method <- match.arg(neighbor_method)
+  if (!length(fcols)) stop("No mz_ features found for spatial analysis.", call. = FALSE)
+  missing_features <- setdiff(fcols, names(pixel_matrix))
+  if (length(missing_features)) {
+    stop("Requested spatial feature(s) are absent: ", paste(missing_features, collapse = ", "), call. = FALSE)
+  }
+  required_columns(pixel_matrix, "pixel_id", "Pixel matrix")
+  if (anyNA(pixel_matrix$pixel_id) || anyDuplicated(pixel_matrix$pixel_id)) {
+    stop("Pixel matrix pixel_id values must be non-missing and unique.", call. = FALSE)
+  }
+  if (!is.null(coordinates)) {
+    required_columns(coordinates, c("pixel_id", x_col, y_col), "Coordinates")
+    if (anyNA(coordinates$pixel_id) || anyDuplicated(coordinates$pixel_id)) {
+      stop("Coordinate pixel_id values must be non-missing and unique.", call. = FALSE)
+    }
+    if (nrow(coordinates) != nrow(pixel_matrix) ||
+        !setequal(coordinates$pixel_id, pixel_matrix$pixel_id)) {
+      stop("Coordinates must contain exactly the pixel_id values in pixel_matrix.", call. = FALSE)
+    }
+    coordinate_index <- match(pixel_matrix$pixel_id, coordinates$pixel_id)
+    coords <- coordinates[coordinate_index, c("pixel_id", x_col, y_col), drop = FALSE]
+  } else {
+    required_columns(pixel_matrix, c(x_col, y_col), "Pixel matrix")
+    coords <- pixel_matrix[, c("pixel_id", x_col, y_col), drop = FALSE]
+  }
+  if (any(!is.finite(coords[[x_col]]) | !is.finite(coords[[y_col]]))) {
+    stop("Spatial coordinates must be finite and non-missing.", call. = FALSE)
+  }
+  if (is.null(neighbors)) {
+    neighbors <- build_spatial_neighbors(
+      coords[[x_col]], coords[[y_col]], method = neighbor_method,
+      distance_threshold = distance_threshold, weights = weights,
+      symmetric = symmetric
+    )
+  } else {
+    if (!inherits(neighbors, "spatial_neighbors")) {
+      stop("neighbors must come from build_spatial_neighbors().", call. = FALSE)
+    }
+    if (!isTRUE(all.equal(as.numeric(coords[[x_col]]), neighbors$x)) ||
+        !isTRUE(all.equal(as.numeric(coords[[y_col]]), neighbors$y))) {
+      stop("neighbors coordinates and pixel_matrix row order do not match.", call. = FALSE)
+    }
+  }
+
+  if (!is.null(seed)) set.seed(seed)
+  rows <- lapply(fcols, function(feature) {
+    stat <- compute_gearys_c_grid(
+      values = pixel_matrix[[feature]], n_perm = n_perm,
+      alternative = alternative, seed = NULL, neighbors = neighbors
+    )
+    data.frame(
+      feature = feature, gearys_c = stat$C, expected_c = stat$expected_C,
+      p_value = stat$p_value, alternative = stat$alternative,
+      n = stat$n, n_total = stat$n_total, n_effective = stat$n_effective,
+      n_isolated = stat$n_isolated, n_edges = stat$n_edges,
+      stringsAsFactors = FALSE
+    )
+  })
+  result <- do.call(rbind, rows)
+  result$adj_p_value <- stats::p.adjust(result$p_value, method = p_adjust_method)
+  rownames(result) <- NULL
+  result[order(result$adj_p_value, -abs(result$gearys_c - 1), na.last = TRUE), , drop = FALSE]
+}
+
+compare_moran_geary <- function(moran_result,
+                                geary_result,
+                                alpha = 0.05) {
+  required_columns(moran_result, c("feature", "morans_i", "adj_p_value"), "Moran result")
+  required_columns(geary_result, c("feature", "gearys_c", "adj_p_value"), "Geary result")
+  if (anyDuplicated(moran_result$feature) || anyDuplicated(geary_result$feature)) {
+    stop("Each result must contain at most one row per feature.", call. = FALSE)
+  }
+  if (length(alpha) != 1L || !is.finite(alpha) || alpha <= 0 || alpha >= 1) {
+    stop("alpha must be one finite value strictly between 0 and 1.", call. = FALSE)
+  }
+  merged <- merge(
+    moran_result[, c("feature", "morans_i", "p_value", "adj_p_value"), drop = FALSE],
+    geary_result[, c("feature", "gearys_c", "p_value", "adj_p_value"), drop = FALSE],
+    by = "feature", suffixes = c("_moran", "_geary"), sort = FALSE
+  )
+  merged$moran_significant <- is.finite(merged$adj_p_value_moran) & merged$adj_p_value_moran < alpha
+  merged$geary_significant <- is.finite(merged$adj_p_value_geary) & merged$adj_p_value_geary < alpha
+  merged$agreement <- merged$moran_significant == merged$geary_significant
+  merged$both_significant <- merged$moran_significant & merged$geary_significant
+  merged$only_moran <- merged$moran_significant & !merged$geary_significant
+  merged$only_geary <- merged$geary_significant & !merged$moran_significant
+  merged$concordance_class <- ifelse(
+    merged$both_significant, "both_significant",
+    ifelse(merged$only_moran, "moran_only",
+      ifelse(merged$only_geary, "geary_only", "neither_significant"))
+  )
+  merged$alpha <- alpha
+  output <- merged[order(
+    -merged$both_significant,
+    pmin(merged$adj_p_value_moran, merged$adj_p_value_geary),
+    na.last = TRUE
+  ), , drop = FALSE]
+  rownames(output) <- NULL
+  attr(output, "interpretation") <- paste(
+    "Moran and Geary results share the same measurements and spatial graph;",
+    "agreement is a method-sensitivity result, not independent validation."
+  )
+  output
+}
+
+compute_binspect_feature <- function(values,
+                                     neighbors,
+                                     bin_method = c("kmeans", "rank"),
+                                     percentage_rank = 30,
+                                     inference = c("permutation", "fisher_approx"),
+                                     n_perm = 199,
+                                     kmeans_nstart = 10,
+                                     kmeans_iter_max = 100,
+                                     hub_min_neighbors = 1,
+                                     seed = NULL) {
+  bin_method <- match.arg(bin_method)
+  inference <- match.arg(inference)
+  if (!inherits(neighbors, "spatial_neighbors")) {
+    stop("neighbors must come from build_spatial_neighbors().", call. = FALSE)
+  }
+  if (length(percentage_rank) != 1L || !is.finite(percentage_rank) ||
+      percentage_rank <= 0 || percentage_rank >= 100) {
+    stop("percentage_rank must be strictly between 0 and 100.", call. = FALSE)
+  }
+  if (length(n_perm) != 1L || !is.finite(n_perm) || n_perm < 0 || n_perm != as.integer(n_perm)) {
+    stop("n_perm must be one non-negative integer.", call. = FALSE)
+  }
+  n_perm <- as.integer(n_perm)
+  if (inference == "permutation" && n_perm < 1L) {
+    stop("Permutation inference requires n_perm >= 1.", call. = FALSE)
+  }
+  if (length(hub_min_neighbors) != 1L || !is.finite(hub_min_neighbors) ||
+      hub_min_neighbors < 1 || hub_min_neighbors != as.integer(hub_min_neighbors)) {
+    stop("hub_min_neighbors must be one positive integer.", call. = FALSE)
+  }
+  values <- as.numeric(values)
+  n_total <- length(values)
+  if (n_total != length(neighbors$x)) {
+    stop("values must contain one value per spatial-neighbor node.", call. = FALSE)
+  }
+  finite <- is.finite(values)
+  if (sum(finite) < 3L) stop("At least three finite values are required for binSpect.", call. = FALSE)
+  finite_values <- values[finite]
+  if (length(unique(finite_values)) < 2L) {
+    stop("Values are constant; binarization is undefined.", call. = FALSE)
+  }
+  if (!is.null(seed)) set.seed(seed)
+  binary <- rep(NA_integer_, n_total)
+  threshold <- NA_real_
+  if (bin_method == "kmeans") {
+    fit <- stats::kmeans(
+      finite_values, centers = 2L, nstart = kmeans_nstart,
+      iter.max = kmeans_iter_max, algorithm = "Lloyd"
+    )
+    cluster_means <- tapply(finite_values, fit$cluster, mean)
+    high_cluster <- as.integer(names(cluster_means)[which.max(cluster_means)])
+    binary[finite] <- as.integer(fit$cluster == high_cluster)
+    threshold <- mean(range(cluster_means))
+  } else {
+    threshold <- unname(stats::quantile(
+      finite_values, probs = 1 - percentage_rank / 100,
+      na.rm = TRUE, names = FALSE, type = 7
+    ))
+    binary[finite] <- as.integer(finite_values >= threshold)
+  }
+  if (length(unique(binary[finite])) < 2L) {
+    stop("Binarization did not produce both low and high states.", call. = FALSE)
+  }
+
+  edges <- neighbors$undirected_edges
+  if (nrow(edges)) edges <- edges[finite[edges$from] & finite[edges$to], , drop = FALSE]
+  if (!nrow(edges) || sum(edges$weight) <= 0) {
+    stop("binSpect is undefined because the effective graph has no positive-weight edges.", call. = FALSE)
+  }
+  if (any(!is.finite(edges$weight)) || any(edges$weight < 0)) {
+    stop("Spatial neighbor weights must be finite and non-negative.", call. = FALSE)
+  }
+  degree <- tabulate(c(edges$from, edges$to), nbins = n_total)
+  effective <- finite & degree > 0L
+  effective_nodes <- which(effective)
+  effective_binary <- binary[effective_nodes]
+  node_map <- integer(n_total)
+  node_map[effective_nodes] <- seq_along(effective_nodes)
+  edge_i <- node_map[edges$from]
+  edge_j <- node_map[edges$to]
+  edge_weight <- edges$weight
+
+  symmetric_contingency <- function(state) {
+    forward <- table(
+      factor(state[edge_i], levels = c(0, 1)),
+      factor(state[edge_j], levels = c(0, 1))
+    )
+    forward + t(forward)
+  }
+  contingency <- symmetric_contingency(effective_binary)
+  observed_high_high <- sum(edge_weight * (effective_binary[edge_i] == 1L) *
+    (effective_binary[edge_j] == 1L))
+  odds_ratio <- if (contingency[1, 2] * contingency[2, 1] == 0) {
+    if (contingency[1, 1] * contingency[2, 2] > 0) Inf else NA_real_
+  } else {
+    unname(contingency[1, 1] * contingency[2, 2] /
+      (contingency[1, 2] * contingency[2, 1]))
+  }
+  if (inference == "permutation") {
+    permuted <- replicate(n_perm, {
+      perm <- sample(effective_binary, length(effective_binary), replace = FALSE)
+      sum(edge_weight * (perm[edge_i] == 1L) * (perm[edge_j] == 1L))
+    })
+    p_value <- (sum(permuted >= observed_high_high) + 1) / (n_perm + 1)
+  } else {
+    # This reproduces the Fisher-table style used by binSpect, but edges share
+    # nodes and both directions of each undirected edge are represented. The
+    # resulting p-value is therefore an approximation, not an exact graph test.
+    p_value <- stats::fisher.test(contingency, alternative = "greater")$p.value
+  }
+
+  high_nodes <- effective_nodes[effective_binary == 1L]
+  high_neighbor_count <- vapply(high_nodes, function(node) {
+    incident <- unique(c(
+      edges$to[edges$from == node],
+      edges$from[edges$to == node]
+    ))
+    sum(binary[incident] == 1L, na.rm = TRUE)
+  }, integer(1))
+  list(
+    p_value = p_value, odds_ratio = odds_ratio,
+    high_high_edge_weight = observed_high_high,
+    contingency_table = contingency,
+    n_high = sum(effective_binary == 1L),
+    high_fraction = mean(effective_binary == 1L),
+    n_effective = length(effective_nodes),
+    n_isolated_or_nonfinite = n_total - length(effective_nodes),
+    n_edges = nrow(edges),
+    n_hub = sum(high_neighbor_count >= hub_min_neighbors),
+    bin_method = bin_method, threshold = threshold,
+    inference = inference, n_perm = if (inference == "permutation") n_perm else 0L,
+    mean_expression = mean(finite_values),
+    mean_high_expression = mean(values[high_nodes])
+  )
+}
+
+compute_spatially_variable_metabolites_binspect <- function(
+    pixel_matrix,
+    coordinates = NULL,
+    x_col = "x",
+    y_col = "y",
+    fcols = feature_columns(pixel_matrix),
+    bin_method = c("kmeans", "rank"),
+    percentage_rank = 30,
+    inference = c("permutation", "fisher_approx"),
+    n_perm = 199,
+    p_adjust_method = "BH",
+    seed = NULL,
+    neighbors = NULL,
+    neighbor_method = c("rook", "queen", "distance"),
+    distance_threshold = NULL,
+    weights = "binary",
+    symmetric = TRUE) {
+  bin_method <- match.arg(bin_method)
+  inference <- match.arg(inference)
+  neighbor_method <- match.arg(neighbor_method)
+  if (!length(fcols)) stop("No mz_ features found for spatial analysis.", call. = FALSE)
+  missing_features <- setdiff(fcols, names(pixel_matrix))
+  if (length(missing_features)) {
+    stop("Requested spatial feature(s) are absent: ", paste(missing_features, collapse = ", "), call. = FALSE)
+  }
+  required_columns(pixel_matrix, "pixel_id", "Pixel matrix")
+  if (anyNA(pixel_matrix$pixel_id) || anyDuplicated(pixel_matrix$pixel_id)) {
+    stop("Pixel matrix pixel_id values must be non-missing and unique.", call. = FALSE)
+  }
+  if (!is.null(coordinates)) {
+    required_columns(coordinates, c("pixel_id", x_col, y_col), "Coordinates")
+    if (anyNA(coordinates$pixel_id) || anyDuplicated(coordinates$pixel_id)) {
+      stop("Coordinate pixel_id values must be non-missing and unique.", call. = FALSE)
+    }
+    if (nrow(coordinates) != nrow(pixel_matrix) ||
+        !setequal(coordinates$pixel_id, pixel_matrix$pixel_id)) {
+      stop("Coordinates must contain exactly the pixel_id values in pixel_matrix.", call. = FALSE)
+    }
+    coords <- coordinates[match(pixel_matrix$pixel_id, coordinates$pixel_id),
+      c("pixel_id", x_col, y_col), drop = FALSE]
+  } else {
+    required_columns(pixel_matrix, c(x_col, y_col), "Pixel matrix")
+    coords <- pixel_matrix[, c("pixel_id", x_col, y_col), drop = FALSE]
+  }
+  if (any(!is.finite(coords[[x_col]]) | !is.finite(coords[[y_col]]))) {
+    stop("Spatial coordinates must be finite and non-missing.", call. = FALSE)
+  }
+  if (is.null(neighbors)) {
+    neighbors <- build_spatial_neighbors(
+      coords[[x_col]], coords[[y_col]], method = neighbor_method,
+      distance_threshold = distance_threshold, weights = weights,
+      symmetric = symmetric
+    )
+  } else {
+    if (!inherits(neighbors, "spatial_neighbors")) {
+      stop("neighbors must come from build_spatial_neighbors().", call. = FALSE)
+    }
+    if (!isTRUE(all.equal(as.numeric(coords[[x_col]]), neighbors$x)) ||
+        !isTRUE(all.equal(as.numeric(coords[[y_col]]), neighbors$y))) {
+      stop("neighbors coordinates and pixel_matrix row order do not match.", call. = FALSE)
+    }
+  }
+  feature_seeds <- rep(NA_integer_, length(fcols))
+  if (!is.null(seed)) {
+    set.seed(seed)
+    feature_seeds <- sample.int(.Machine$integer.max, length(fcols))
+  }
+  rows <- lapply(seq_along(fcols), function(feature_index) {
+    feature <- fcols[feature_index]
+    calculation <- tryCatch(
+      compute_binspect_feature(
+        values = pixel_matrix[[feature]], neighbors = neighbors,
+        bin_method = bin_method, percentage_rank = percentage_rank,
+        inference = inference, n_perm = n_perm,
+        seed = if (is.na(feature_seeds[feature_index])) NULL else feature_seeds[feature_index]
+      ),
+      error = function(error) error
+    )
+    if (inherits(calculation, "error")) {
+      return(data.frame(
+        feature = feature, p_value = NA_real_, odds_ratio = NA_real_,
+        high_high_edge_weight = NA_real_, n_high = NA_integer_,
+        high_fraction = NA_real_, n_effective = NA_integer_, n_hub = NA_integer_,
+        mean_expression = NA_real_, mean_high_expression = NA_real_,
+        bin_method = bin_method, inference = inference,
+        status = "not_tested", error_message = conditionMessage(calculation),
+        stringsAsFactors = FALSE
+      ))
+    }
+    data.frame(
+      feature = feature, p_value = calculation$p_value,
+      odds_ratio = calculation$odds_ratio,
+      high_high_edge_weight = calculation$high_high_edge_weight,
+      n_high = calculation$n_high, high_fraction = calculation$high_fraction,
+      n_effective = calculation$n_effective, n_hub = calculation$n_hub,
+      mean_expression = calculation$mean_expression,
+      mean_high_expression = calculation$mean_high_expression,
+      bin_method = calculation$bin_method, inference = calculation$inference,
+      status = "tested", error_message = NA_character_, stringsAsFactors = FALSE
+    )
+  })
+  result <- do.call(rbind, rows)
+  result$adj_p_value <- stats::p.adjust(result$p_value, method = p_adjust_method)
+  rownames(result) <- NULL
+  result[order(result$adj_p_value, -result$odds_ratio, na.last = TRUE), , drop = FALSE]
+}
+
+compare_svg_methods <- function(moran_result,
+                                geary_result,
+                                binspect_result,
+                                alpha = 0.05) {
+  required_columns(moran_result, c("feature", "morans_i", "adj_p_value"), "Moran result")
+  required_columns(geary_result, c("feature", "gearys_c", "adj_p_value"), "Geary result")
+  required_columns(binspect_result, c("feature", "odds_ratio", "adj_p_value"), "binSpect result")
+  if (anyDuplicated(moran_result$feature) || anyDuplicated(geary_result$feature) ||
+      anyDuplicated(binspect_result$feature)) {
+    stop("Each result must contain at most one row per feature.", call. = FALSE)
+  }
+  if (length(alpha) != 1L || !is.finite(alpha) || alpha <= 0 || alpha >= 1) {
+    stop("alpha must be one finite value strictly between 0 and 1.", call. = FALSE)
+  }
+  merged <- Reduce(function(left, right) merge(left, right, by = "feature", sort = FALSE), list(
+    data.frame(feature = moran_result$feature, morans_i = moran_result$morans_i,
+      moran_adj_p = moran_result$adj_p_value),
+    data.frame(feature = geary_result$feature, gearys_c = geary_result$gearys_c,
+      geary_adj_p = geary_result$adj_p_value),
+    data.frame(feature = binspect_result$feature, odds_ratio = binspect_result$odds_ratio,
+      binspect_adj_p = binspect_result$adj_p_value)
+  ))
+  p_columns <- c("moran_adj_p", "geary_adj_p", "binspect_adj_p")
+  tested <- is.finite(as.matrix(merged[p_columns]))
+  significant <- tested & as.matrix(merged[p_columns]) < alpha
+  merged$moran_significant <- ifelse(tested[, 1], significant[, 1], NA)
+  merged$geary_significant <- ifelse(tested[, 2], significant[, 2], NA)
+  merged$binspect_significant <- ifelse(tested[, 3], significant[, 3], NA)
+  merged$n_methods_tested <- rowSums(tested)
+  merged$n_methods_significant <- rowSums(significant)
+  merged$all_tested_methods_significant <- merged$n_methods_tested > 0 &
+    merged$n_methods_significant == merged$n_methods_tested
+  merged$alpha <- alpha
+  output <- merged[order(
+    -merged$n_methods_significant, -merged$n_methods_tested,
+    merged$moran_adj_p, na.last = TRUE
+  ), , drop = FALSE]
+  rownames(output) <- NULL
+  attr(output, "interpretation") <- paste(
+    "The three methods share measurements and a spatial graph. Concordance is",
+    "a method-sensitivity result, not independent validation or proof of identity."
+  )
+  output
 }
 
 cross_validate_msi_lcms <- function(msi_features,

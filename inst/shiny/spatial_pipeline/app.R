@@ -1,1652 +1,614 @@
 options(shiny.maxRequestSize = 5 * 1024^3)
+suppressPackageStartupMessages({
+  library(shiny)
+  library(SpatialOmicsMSI)
+  library(ggplot2)
+  library(DT)
+})
 
-library(shiny)
-library(SpatialOmicsMSI)
-library(ggplot2)
-library(viridis)
-library(DT)
+project_root <- Sys.getenv("SPATIALOMICS_PROJECT_ROOT", unset = "")
+if (!nzchar(project_root)) {
+  candidate <- normalizePath(file.path(getwd(), "../../.."), mustWork = FALSE)
+  project_root <- if (dir.exists(file.path(candidate, "data_raw"))) candidate else getwd()
+}
+session_root <- Sys.getenv("SPATIALOMICS_SESSION_ROOT", unset = tempdir())
 
-DEFAULT_OUTPUT_DIR <- Sys.getenv(
-  "SPATIALOMICS_OUTPUT_DIR",
-  unset = file.path(getwd(), "outputs", "spatial_outputs")
+`%or%` <- function(x, y) if (is.null(x) || length(x) == 0L || is.na(x) || !nzchar(x)) y else x
+present_path <- function(x) length(x) == 1L && !is.na(x) && nzchar(trimws(x))
+require_columns <- function(data, columns, label) {
+  missing <- setdiff(columns, names(data))
+  if (length(missing)) stop(label, " is missing required column(s): ", paste(missing, collapse = ", "), call. = FALSE)
+}
+normalize_feature_names <- function(columns) {
+  output <- columns; numeric <- suppressWarnings(is.finite(as.numeric(columns)))
+  output[numeric] <- paste0("mz_", columns[numeric]); gsub("-", "_", output, fixed = TRUE)
+}
+
+example_datasets <- list(
+  brain01 = list(
+    label = "Brain01 registration example",
+    msi_input_type = "imzml", imzml_path = file.path(project_root,
+      "data_raw/mouse_brain_he_msi/metaspace_brain01/Brain01_Bregma-1-46_centroid.imzML"),
+    ibd_path = file.path(project_root,
+      "data_raw/mouse_brain_he_msi/metaspace_brain01/Brain01_Bregma-1-46_centroid.ibd"),
+    optical_path = file.path(project_root,
+      "data_raw/mouse_brain_he_msi/metaspace_brain01/optical_brightfield.jpg"),
+    transform_path = file.path(project_root,
+      "data_raw/mouse_brain_he_msi/metaspace_brain01/optical_transform_api.json"),
+    attribution_path = file.path(project_root,
+      "data_raw/mouse_brain_he_msi/metaspace_brain01/attribution_license.json"),
+    sample_id = "Brain01", section_id = "Brain01_Bregma-1-46", subject_id = "Brain01",
+    ion_mode = "positive", ion_mode_source = "METASPACE_dataset_metadata",
+    spectral_processing = "processed_peak_lists", alignment_ppm = 10,
+    peak_pick_snr = 6, min_detection_fraction = 0, make_tissue_mask = FALSE,
+    source_note = "METASPACE 2016-09-22_11h16m17s; CC BY 4.0; LAVIGNE Régis."
+  ),
+  omix = list(
+    label = "OMIX016317 full-brain MSI example",
+    msi_input_type = "imzml", imzml_path = file.path(project_root,
+      "data_raw/full_tissue_mouse_brain/OMIX016317/OMIX016317-02.imzML"),
+    ibd_path = file.path(project_root,
+      "data_raw/full_tissue_mouse_brain/OMIX016317/OMIX016317-01.ibd"),
+    sample_id = "mbrain1_neg100", section_id = "mbrain1_neg100", subject_id = "mbrain1",
+    ion_mode = "negative", ion_mode_source = "OMIX_record_and_imzML_audit",
+    spectral_processing = "profile_diff", alignment_ppm = 10,
+    peak_pick_snr = 6, min_detection_fraction = .10, make_tissue_mask = TRUE,
+    source_note = "OMIX016317 mbrain1_neg100; independent complete-brain MSI technical example."
+  ),
+  lcms = list(
+    label = "MSV000090179 LC-MS/MS example", msi_input_type = "none",
+    lcms_path = file.path(project_root,
+      "data_raw/mouse_brain_lcms/msv000090179/pos_mouse_female_brain_12w_1.mzML"),
+    sample_id = "mouse_brain_12w_rep1", section_id = "not_applicable",
+    subject_id = "mouse_brain_12w_rep1", ion_mode = "positive",
+    ion_mode_source = "MassIVE_sample_metadata", spectral_processing = "processed_peak_lists",
+    alignment_ppm = 10, peak_pick_snr = 6, min_detection_fraction = 0,
+    make_tissue_mask = FALSE,
+    source_note = "MassIVE MSV000090179; CC0; female mouse brain, 12 weeks, replicate 1."
+  )
 )
-DEFAULT_VIP_FILE <- Sys.getenv("SPATIALOMICS_VIP_FILE", unset = "")
 
-read_optional_csv <- function(path) {
-  if (!file.exists(path)) return(NULL)
-  read.csv(path, check.names = FALSE, stringsAsFactors = FALSE)
+preset_spec <- function(key) {
+  if (!key %in% names(example_datasets)) stop("Unknown example dataset.", call. = FALSE)
+  example_datasets[[key]]
 }
 
-load_output_bundle <- function(output_dir = DEFAULT_OUTPUT_DIR, vip_file = DEFAULT_VIP_FILE) {
-  vip <- read_optional_csv(vip_file)
-  if (!is.null(vip)) {
-    vip <- normalize_metaboanalyst_result(vip, source_name = basename(vip_file))
-    if ("VIP" %in% names(vip)) vip <- vip[order(vip$VIP, decreasing = TRUE), , drop = FALSE]
+cardinal_pair_path <- function(pair) {
+  same_stem <- identical(tolower(tools::file_path_sans_ext(basename(pair$imzml_path))),
+                           tolower(tools::file_path_sans_ext(basename(pair$ibd_path))))
+  if (same_stem) return(list(imzml_path = pair$imzml_path, temporary = FALSE))
+  directory <- tempfile("SpatialOmicsMSI-cardinal-pair-"); dir.create(directory)
+  imzml <- file.path(directory, "paired.imzML"); ibd <- file.path(directory, "paired.ibd")
+  if (!file.copy(pair$imzml_path, imzml, overwrite = FALSE, copy.mode = TRUE) || !file.symlink(pair$ibd_path, ibd)) {
+    stop("Could not create a temporary read-only same-basename pair for Cardinal.", call. = FALSE)
   }
-
-  list(
-    output_dir = output_dir,
-    vip_file = vip_file,
-    pixel_matrix = read_optional_csv(file.path(output_dir, "pixel_feature_matrix.csv")),
-    feature_mapping = read_optional_csv(file.path(output_dir, "feature_mapping.csv")),
-    selected_features = read_optional_csv(file.path(output_dir, "selected_features.csv")),
-    reduced_matrix = read_optional_csv(file.path(output_dir, "reduced_pixel_matrix.csv")),
-    preprocessed_matrix = read_optional_csv(file.path(output_dir, "preprocessed_matrix.csv")),
-    clustered_matrix = read_optional_csv(file.path(output_dir, "clustered_matrix.csv")),
-    sample_matrix = read_optional_csv(file.path(output_dir, "sample_matrix.csv")),
-    sample_mapping = read_optional_csv(file.path(output_dir, "sample_mapping.csv")),
-    metaboanalyst_data = read_optional_csv(file.path(output_dir, "metaboanalyst_data.csv")),
-    section_mapping = read_optional_csv(file.path(output_dir, "section_mapping.csv")),
-    background_stats = read_optional_csv(file.path(output_dir, "background_stats.csv")),
-    pairwise_permanova = read_optional_csv(file.path(output_dir, "pairwise_permanova.csv")),
-    vip = vip
-  )
+  Sys.chmod(imzml, "0444")
+  list(imzml_path = imzml, temporary = TRUE)
 }
 
-read_csv_upload <- function(upload) {
-  if (is.null(upload)) return(NULL)
-  data <- read.csv(upload$datapath, check.names = FALSE, stringsAsFactors = FALSE)
-  attr(data, "source_name") <- upload$name
-  data
-}
-
-validate_histology_control_points <- function(control_points) {
-  required_columns(
-    control_points,
-    c("histology_x", "histology_y", "msi_x", "msi_y"),
-    "H&E control points"
-  )
-  if ("section_id" %in% names(control_points)) {
-    control_points$section_id <- as.character(control_points$section_id)
+inspect_imzml_input <- function(imzml_path, ibd_path) {
+  pair <- validate_imzml_ibd_pair(imzml_path, ibd_path)
+  if (!requireNamespace("Cardinal", quietly = TRUE)) stop("Cardinal is required to inspect imzML metadata.", call. = FALSE)
+  readable <- cardinal_pair_path(pair)
+  object <- Cardinal::readMSIData(readable$imzml_path)
+  coordinates <- as.data.frame(Cardinal::coord(object))
+  require_columns(coordinates, c("x", "y"), "imzML coordinates")
+  if (!nrow(coordinates) || any(!is.finite(coordinates$x) | !is.finite(coordinates$y))) {
+    stop("imzML coordinates must be finite and non-empty.", call. = FALSE)
   }
-  control_points
-}
-
-preserve_uploaded_msi_files <- function(upload) {
-  req(upload)
-  temp_dir <- tempfile("msi_upload_")
-  dir.create(temp_dir)
-  paths <- file.path(temp_dir, upload$name)
-  file.copy(upload$datapath, paths, overwrite = TRUE)
-  imzml <- paths[tolower(tools::file_ext(paths)) == "imzml"]
-  if (length(imzml) != 1) {
-    stop("Upload exactly one .imzML file with its matching .ibd file.", call. = FALSE)
+  if (anyDuplicated(coordinates[c("x", "y")])) stop("imzML contains duplicate x/y coordinates.", call. = FALSE)
+  experiment <- Cardinal::experimentData(object)
+  spectrum_type <- paste(as.character(experiment$spectrumType), collapse = "; ")
+  if (nzchar(spectrum_type) && !grepl("MS1", spectrum_type, fixed = TRUE)) {
+    stop("The MSI workflow requires MS1 spectra; metadata reports: ", spectrum_type, call. = FALSE)
   }
-  imzml
+  raw_mz <- Cardinal::mz(object)
+  variable_axis <- is.list(raw_mz) || inherits(raw_mz, "matter_list")
+  cv_text <- paste(readLines(pair$imzml_path, n = 1000L, warn = FALSE), collapse = " ")
+  positive_cv <- grepl("MS:1000130", cv_text, fixed = TRUE)
+  negative_cv <- grepl("MS:1000129", cv_text, fixed = TRUE)
+  polarity_cv <- if (xor(positive_cv, negative_cv)) if (positive_cv) "positive" else "negative" else "not reported or ambiguous"
+  list(pair = pair, coordinates = coordinates,
+       summary = data.frame(
+         item = c("Spectra/pixels", "x range", "y range", "MS level", "Spectrum representation",
+                  "m/z layout", "Polarity interpretation"),
+         value = c(nrow(coordinates), paste(range(coordinates$x), collapse = " to "),
+                   paste(range(coordinates$y), collapse = " to "), spectrum_type %or% "not reported",
+                   if (isTRUE(Cardinal::isCentroided(object))) "centroided (CV)" else "profile or CV not reported",
+                   if (variable_axis) "per-spectrum variable" else "shared axis", polarity_cv),
+         stringsAsFactors = FALSE),
+       mz_layout = if (variable_axis) "variable" else "shared", polarity_cv = polarity_cv)
 }
 
-preserve_uploaded_serial_msi_files <- function(upload) {
-  req(upload)
-  temp_dir <- tempfile("msi_upload_")
-  dir.create(temp_dir)
-  paths <- file.path(temp_dir, upload$name)
-  file.copy(upload$datapath, paths, overwrite = TRUE)
-  imzml <- paths[tolower(tools::file_ext(paths)) == "imzml"]
-  if (length(imzml) < 1) {
-    stop("Upload at least one .imzML file with matching .ibd files.", call. = FALSE)
+load_shared_axis_pair <- function(imzml_path, ibd_path, sample_id, section_id,
+                                  ion_mode, ion_mode_source) {
+  pair <- validate_imzml_ibd_pair(imzml_path, ibd_path)
+  readable <- cardinal_pair_path(pair)
+  output <- load_centroided_msi_features(readable$imzml_path, sample_id, section_id, ion_mode, ion_mode_source)
+  output$parameters$temporary_same_basename_pair <- readable$temporary
+  output
+}
+
+read_pixel_feature_csv <- function(path, sample_id, section_id, subject_id) {
+  data <- utils::read.csv(path, check.names = FALSE, stringsAsFactors = FALSE)
+  require_columns(data, c("x", "y"), "Processed pixel-by-feature CSV")
+  if (!nrow(data) || any(!is.finite(data$x) | !is.finite(data$y)) || anyDuplicated(data[c("x", "y")])) {
+    stop("CSV x/y coordinates must be finite, non-empty and unique.", call. = FALSE)
   }
-  imzml[order(basename(imzml))]
+  metadata <- c("pixel_id", "sample_id", "section_id", "subject_id", "x", "y", "domain_id", "domain_label")
+  candidates <- setdiff(names(data), metadata)
+  numeric_feature <- vapply(data[candidates], is.numeric, logical(1))
+  features <- candidates[numeric_feature]
+  if (!length(features)) stop("CSV must contain at least one numeric feature column in addition to x/y.", call. = FALSE)
+  normalized <- normalize_feature_names(features)
+  normalized <- make.unique(normalized, sep = "__")
+  values <- as.data.frame(data[features], check.names = FALSE)
+  names(values) <- normalized
+  pixel_id <- if ("pixel_id" %in% names(data)) data$pixel_id else seq_len(nrow(data))
+  if (anyNA(pixel_id) || anyDuplicated(pixel_id)) stop("CSV pixel_id must be non-missing and unique.", call. = FALSE)
+  pixel <- data.frame(pixel_id = pixel_id, sample_id = sample_id, section_id = section_id,
+                      x = data$x, y = data$y, values, check.names = FALSE)
+  mz <- suppressWarnings(as.numeric(sub("^mz_", "", sub("__.*$", "", normalized))))
+  feature_metadata <- data.frame(feature_id = sprintf("feature_%05d", seq_along(features)),
+    column_name = normalized, mz = mz, source_column = features, ion_mode = NA_character_)
+  coordinates <- data.frame(pixel_id = pixel_id, sample_id = sample_id, section_id = section_id,
+                            subject_id = subject_id, x = data$x, y = data$y)
+  matrix <- as.matrix(values); storage.mode(matrix) <- "double"
+  pixel_qc <- data.frame(coordinates, raw_tic = rowSums(matrix, na.rm = TRUE),
+                         raw_peak_count = rowSums(is.finite(matrix) & matrix > 0))
+  list(pixel_feature_matrix = pixel, coordinates = coordinates,
+       feature_metadata = feature_metadata,
+       qc_summary = data.frame(spectra_count = nrow(data), feature_count = length(features),
+         x_min = min(data$x), x_max = max(data$x), y_min = min(data$y), y_max = max(data$y),
+         missing_intensity = sum(!is.finite(matrix)), zero_fraction = mean(matrix == 0, na.rm = TRUE)),
+       parameters = list(input_type = "processed_pixel_feature_csv"),
+       provenance = make_pipeline_manifest(path, input_type = "processed_pixel_feature_csv",
+         parameters = list(sample_id = sample_id, section_id = section_id, subject_id = subject_id)),
+       pixel_qc = pixel_qc)
 }
 
-download_csv <- function(data_fun, filename) {
-  downloadHandler(
-    filename = function() filename,
-    content = function(file) write.csv(data_fun(), file, row.names = FALSE)
-  )
+validate_label_file <- function(path) {
+  labels <- utils::read.csv(path, check.names = FALSE, stringsAsFactors = FALSE)
+  require_columns(labels, c("x", "y"), "ROI/domain labels")
+  label_col <- intersect(c("domain_id", "roi_id", "label", "domain_label", "roi_label"), names(labels))[1]
+  if (is.na(label_col)) stop("ROI/domain CSV needs one label column: domain_id, roi_id, label, domain_label or roi_label.", call. = FALSE)
+  key_cols <- intersect(c("sample_id", "section_id"), names(labels))
+  if (anyDuplicated(labels[c(key_cols, "x", "y")])) stop("ROI/domain labels are not unique by their coordinate key.", call. = FALSE)
+  list(data = labels, label_column = label_col)
 }
 
-plot_ion_image <- function(pixel_matrix, column_name, title = NULL, discrete = FALSE) {
-  validate(
-    need(!is.null(pixel_matrix), "Upload or generate a pixel matrix first."),
-    need(column_name %in% names(pixel_matrix), "Select a valid feature.")
-  )
-  ggplot(pixel_matrix, aes(x = x, y = y, fill = .data[[column_name]])) +
-    geom_tile() +
-    coord_fixed() +
-    scale_y_reverse() +
-    labs(title = title %||% column_name, x = "x", y = "y", fill = if (discrete) "Cluster" else "Intensity") +
-    theme_minimal(base_size = 12)
+validate_analysis_spec <- function(spec, inspect = TRUE) {
+  errors <- character(); notes <- character(); metadata <- NULL
+  has_msi <- spec$msi_input_type %in% c("imzml", "csv")
+  has_lcms <- present_path(spec$lcms_path)
+  if (!has_msi && !has_lcms) errors <- c(errors, "Provide MSI data, an LC-MS/MS mzML file, or both.")
+  if (has_msi) {
+    for (field in c("sample_id", "section_id", "subject_id", "ion_mode", "ion_mode_source")) {
+      if (!present_path(spec[[field]])) errors <- c(errors, paste(field, "is required for MSI analysis."))
+    }
+    if (!spec$ion_mode %in% c("positive", "negative")) errors <- c(errors, "Ion mode must be positive or negative.")
+  }
+  required_files <- character()
+  if (identical(spec$msi_input_type, "imzml")) required_files <- c(required_files, spec$imzml_path, spec$ibd_path)
+  if (identical(spec$msi_input_type, "csv")) required_files <- c(required_files, spec$csv_path)
+  optional_files <- unlist(spec[c("optical_path", "transform_path", "labels_path", "lcms_path", "attribution_path")], use.names = FALSE)
+  supplied <- c(required_files, optional_files[vapply(optional_files, present_path, logical(1))])
+  missing <- supplied[!file.exists(supplied)]
+  if (length(missing)) errors <- c(errors, paste(length(missing), "supplied file(s) do not exist; see Technical details."))
+  if (!length(errors) && identical(spec$msi_input_type, "imzml")) {
+    result <- tryCatch(if (inspect) inspect_imzml_input(spec$imzml_path, spec$ibd_path)
+                       else list(pair = validate_imzml_ibd_pair(spec$imzml_path, spec$ibd_path), mz_layout = NA_character_),
+                       error = function(e) e)
+    if (inherits(result, "error")) errors <- c(errors, conditionMessage(result)) else {
+      metadata <- result; notes <- c(notes, "imzML/ibd pairing and coordinate metadata passed.")
+      if (inspect && result$polarity_cv %in% c("positive", "negative") && !identical(result$polarity_cv, spec$ion_mode)) {
+        errors <- c(errors, paste0("Explicit ion mode ('", spec$ion_mode, "') conflicts with imzML CV polarity ('", result$polarity_cv, "')."))
+      }
+      if (inspect && !result$polarity_cv %in% c("positive", "negative")) notes <- c(notes, "imzML CV polarity was not definitive; the explicit ion-mode source is retained in provenance.")
+    }
+  }
+  if (!length(errors) && identical(spec$msi_input_type, "csv")) {
+    result <- tryCatch(read_pixel_feature_csv(spec$csv_path, spec$sample_id, spec$section_id, spec$subject_id), error = function(e) e)
+    if (inherits(result, "error")) errors <- c(errors, conditionMessage(result)) else {
+      metadata <- list(coordinates = result$coordinates, mz_layout = "table",
+        summary = data.frame(item = c("Pixels", "Features", "x range", "y range", "Polarity interpretation"),
+          value = c(nrow(result$coordinates), nrow(result$feature_metadata),
+            paste(range(result$coordinates$x), collapse = " to "), paste(range(result$coordinates$y), collapse = " to "),
+            "supplied explicitly by the user")))
+      notes <- c(notes, "Processed pixel-by-feature CSV structure passed.")
+    }
+  }
+  if (present_path(spec$optical_path) != present_path(spec$transform_path)) {
+    notes <- c(notes, "Registration is disabled until both an optical JPEG and a transform JSON are supplied.")
+  }
+  if (!length(errors) && present_path(spec$optical_path) && present_path(spec$transform_path)) {
+    if (!tolower(tools::file_ext(spec$optical_path)) %in% c("jpg", "jpeg")) errors <- c(errors, "Optical input must currently be JPEG.")
+    optical_ok <- tryCatch({ jpeg::readJPEG(spec$optical_path); TRUE }, error = function(e) e)
+    transform_ok <- tryCatch({ read_metaspace_transform(spec$transform_path); TRUE }, error = function(e) e)
+    if (inherits(optical_ok, "error")) errors <- c(errors, paste("Optical image:", conditionMessage(optical_ok)))
+    if (inherits(transform_ok, "error")) errors <- c(errors, paste("Registration transform:", conditionMessage(transform_ok)))
+  }
+  labels <- NULL
+  if (!length(errors) && present_path(spec$labels_path)) {
+    labels <- tryCatch(validate_label_file(spec$labels_path), error = function(e) e)
+    if (inherits(labels, "error")) errors <- c(errors, conditionMessage(labels))
+    else if (!is.null(metadata$coordinates)) {
+      relevant <- labels$data
+      if ("sample_id" %in% names(relevant)) relevant <- relevant[as.character(relevant$sample_id) == spec$sample_id, , drop = FALSE]
+      if ("section_id" %in% names(relevant)) relevant <- relevant[as.character(relevant$section_id) == spec$section_id, , drop = FALSE]
+      pixel_key <- paste(metadata$coordinates$x, metadata$coordinates$y, sep = "\r")
+      label_key <- paste(relevant$x, relevant$y, sep = "\r")
+      unknown <- sum(!label_key %in% pixel_key)
+      if (unknown) errors <- c(errors, paste(unknown, "ROI/domain coordinate(s) do not occur in the MSI input."))
+      else notes <- c(notes, paste(nrow(relevant), "ROI/domain coordinate(s) matched the MSI coordinate system."))
+    }
+  }
+  if (!length(errors) && has_lcms) {
+    if (tolower(tools::file_ext(spec$lcms_path)) != "mzml") errors <- c(errors, "LC-MS/MS input must be mzML.")
+    else {
+      connection <- file(spec$lcms_path, open = "rb"); on.exit(close(connection), add = TRUE)
+      header <- readChar(connection, nchars = min(file.info(spec$lcms_path)$size, 2e6), useBytes = TRUE)
+      if (!grepl("<mzML", header, fixed = TRUE)) errors <- c(errors, "LC-MS/MS input does not contain an mzML document header.")
+    }
+  }
+  capabilities <- list(msi = has_msi && !length(errors), processing = has_msi && !length(errors),
+    registration = has_msi && present_path(spec$optical_path) && present_path(spec$transform_path) && !length(errors),
+    labels = has_msi && present_path(spec$labels_path) && !length(errors),
+    domains = has_msi && !length(errors), moran = has_msi && !length(errors),
+    lcms = has_lcms && !length(errors), download = !length(errors))
+  list(valid = !length(errors), errors = unique(errors), notes = unique(notes), metadata = metadata,
+       labels = if (inherits(labels, "error")) NULL else labels, capabilities = capabilities,
+       files = supplied)
 }
 
-`%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
+resolve_label_mapping <- function(labels_info, coordinates, sample_id, section_id) {
+  labels <- labels_info$data
+  if ("sample_id" %in% names(labels)) labels <- labels[as.character(labels$sample_id) == sample_id, , drop = FALSE]
+  if ("section_id" %in% names(labels)) labels <- labels[as.character(labels$section_id) == section_id, , drop = FALSE]
+  label_key <- paste(labels$x, labels$y, sep = "\r")
+  pixel_key <- paste(coordinates$x, coordinates$y, sep = "\r")
+  index <- match(pixel_key, label_key)
+  raw <- rep("-1", length(index)); raw[!is.na(index)] <- as.character(labels[[labels_info$label_column]][index[!is.na(index)]])
+  data.frame(coordinates, domain_id = raw,
+    domain_label = ifelse(raw == "-1", "unclassified/background", paste0("user-supplied domain/ROI ", raw)),
+    label_source = "user-supplied ROI/domain CSV", stringsAsFactors = FALSE)
+}
 
-ui <- fluidPage(
-  titlePanel("MSI Spatial Omics Pipeline"),
-  sidebarLayout(
-    sidebarPanel(
-      width = 3,
-      h4("Demo outputs"),
-      checkboxInput("use_existing_outputs", "Use existing spatial_outputs folder", TRUE),
-      textInput("existing_output_dir", "Output folder", value = DEFAULT_OUTPUT_DIR),
-      textInput("existing_vip_file", "MetaboAnalyst VIP file", value = DEFAULT_VIP_FILE),
-      actionButton("reload_existing_outputs", "Reload existing outputs", class = "btn-primary"),
-      verbatimTextOutput("existing_output_status"),
-      tags$hr(),
-      h4("Step 1: Load"),
-      radioButtons(
-        "input_mode",
-        "Input mode",
-        choices = c("Single section" = "single", "Serial sections" = "serial"),
-        selected = "single"
-      ),
-      fileInput("msi_files", "imzML + ibd file(s)", accept = c(".imzML", ".ibd"), multiple = TRUE),
-      fileInput("features", "mzmine_features.csv", accept = ".csv"),
-      tags$details(
-        tags$summary("Large local files (recommended)"),
-        textInput("local_imzml_path", "Local .imzML path (one per line for serial sections)", value = ""),
-        textInput("local_features_path", "Local mzmine_features.csv path", value = ""),
-        tags$small("Local paths bypass browser upload and avoid copying a large .ibd file twice.")
-      ),
-      numericInput("ppm", "ppm tolerance", value = 10, min = 1, max = 50, step = 1),
-          actionButton("extract", "Extract from imzML"),
-          uiOutput("extraction_progress"),
-          verbatimTextOutput("extraction_status"),
-      tags$hr(),
-      fileInput("pixel_matrix_upload", "Or upload pixel_feature_matrix.csv", accept = ".csv"),
-      fileInput("feature_mapping_upload", "feature_mapping.csv", accept = ".csv"),
-      tags$hr(),
-      uiOutput("feature_picker"),
-      uiOutput("feature_stats")
-    ),
-    mainPanel(
-      tabsetPanel(
-        id = "tabs",
-        tabPanel(
-          "1 Loaded Outputs",
-          br(),
-          fluidRow(
-            column(4, verbatimTextOutput("loaded_summary")),
-            column(8, DTOutput("pixel_preview"))
-          )
-        ),
-        tabPanel(
-          "2 Ion Images",
-          fluidRow(
-            column(8, plotOutput("ion_plot", height = 560)),
-            column(
-              4,
-              uiOutput("thumbnail_page_control"),
-              actionButton("render_thumbnails", "Render thumbnails")
-            )
-          ),
-          plotOutput(
-            "thumbnail_plot",
-            height = 720,
-            click = "thumbnail_click",
-            dblclick = "thumbnail_dblclick"
-          )
-        ),
-        tabPanel(
-          "3 Select",
-          fluidRow(
-            column(3, sliderInput("cv_top", "CV top percent", min = 0, max = 100, value = 70)),
-            column(3, numericInput("mean_min", "Mean intensity >", value = 0, min = 0)),
-            column(3, sliderInput("nonzero_min", "Non-zero rate", min = 0, max = 1, value = 0.3, step = 0.05)),
-            column(3, radioButtons("combine_mode", "Manual + rule", choices = c("union", "intersection"), selected = "union"))
-          ),
-          conditionalPanel(
-            "input.input_mode == 'serial'",
-            sliderInput("min_section_fraction", "Shared across sections", min = 0, max = 1, value = 1, step = 0.05)
-          ),
-          checkboxGroupInput("manual_features", "Manual features", choices = character()),
-          actionButton("run_selection", "Confirm & run feature selection", class = "btn-primary"),
-          uiOutput("selection_progress"),
-          textOutput("selection_run_status"),
-          textOutput("selected_count"),
-          downloadButton("download_selected", "Download selected_features.csv"),
-          downloadButton("download_reduced", "Download reduced_matrix.csv"),
-          DTOutput("selected_table")
-        ),
-        tabPanel(
-          "4 Preprocess",
-          fluidRow(
-            column(
-              3,
-              checkboxInput("do_background", "Background removal", TRUE),
-              selectInput(
-                "background_method",
-                "Background method",
-                choices = c(
-                  "Log TIC 2-cluster mask" = "log_tic_kmeans",
-                  "TIC percentile" = "tic_percentile",
-                  "Median TIC fraction" = "median_fraction"
-                ),
-                selected = "log_tic_kmeans"
-              ),
-              conditionalPanel(
-                "input.background_method == 'tic_percentile'",
-                sliderInput("background_percentile", "Remove pixels below TIC percentile", min = 0, max = 50, value = 10, step = 1)
-              ),
-              conditionalPanel(
-                "input.background_method == 'median_fraction'",
-                numericInput("background_percent", "Background % of median TIC", 1, min = 0, max = 100)
-              ),
-              numericInput("min_nonzero_features", "Min non-zero features per pixel", 1, min = 0, step = 1)
-            ),
-            column(3, checkboxInput("do_tic", "TIC normalization", TRUE)),
-            column(3, checkboxInput("do_log", "log10(x + 1)", TRUE)),
-            column(3, checkboxInput("do_scale", "Auto scaling", FALSE))
-          ),
-          actionButton("run_preprocess", "Confirm & run preprocessing", class = "btn-primary"),
-          uiOutput("preprocess_progress"),
-          textOutput("preprocess_run_status"),
-          downloadButton("download_preprocessed", "Download preprocessed_matrix.csv"),
-          plotOutput("preprocess_hist", height = 420)
-        ),
-        tabPanel(
-          "5 Segment",
-          fluidRow(
-            column(4, sliderInput("k", "k clusters", min = 2, max = 10, value = 3, step = 1)),
-            column(4, checkboxInput("use_pca_cluster", "PCA before k-means", TRUE)),
-            column(4, numericInput("pca_components", "PCs for k-means", value = 10, min = 1, max = 50, step = 1))
-          ),
-          actionButton("run_clustering", "Confirm & run K-means", class = "btn-primary"),
-          uiOutput("cluster_progress"),
-          textOutput("cluster_run_status"),
-          fluidRow(
-            column(7, plotOutput("cluster_plot", height = 560)),
-            column(5, plotOutput("cluster_diag", height = 560))
-          ),
-          downloadButton("download_clustered", "Download clustered_matrix.csv")
-        ),
-        tabPanel(
-          "6 Sample",
-          radioButtons(
-            "roi_selection_mode",
-            "ROI definition",
-            choices = c("Automatic" = "automatic", "Manual" = "manual"),
-            selected = "automatic",
-            inline = TRUE
-          ),
-          conditionalPanel(
-            "input.roi_selection_mode == 'automatic'",
-            fluidRow(
-              column(3, numericInput("roi_size", "ROI size (x/y units)", value = 4000, min = 0.001)),
-              column(3, selectInput("roi_shape", "ROI shape", choices = c("square", "circle"))),
-              column(3, numericInput("max_rois", "Maximum ROI count", value = 10, min = 1, step = 1)),
-              column(3, numericInput("roi_tau", "Stop threshold tau", value = 0.03, min = 0, max = 1, step = 0.01))
-            ),
-            fluidRow(
-              column(3, numericInput("balance_weight", "Balance weight", value = 1, min = 0)),
-              column(3, numericInput("coverage_weight", "Coverage weight", value = 1, min = 0)),
-              column(3, numericInput("size_weight", "Size weight", value = 1, min = 0)),
-              column(3, fileInput("prior_weights_upload", "Optional cluster, weight CSV", accept = ".csv"))
-            )
-          ),
-          conditionalPanel(
-            "input.roi_selection_mode == 'manual'",
-            radioButtons(
-              "manual_roi_method",
-              "Manual input",
-              choices = c(
-                "Choose clusters" = "cluster",
-                "Draw rectangle" = "draw_rectangle",
-                "Draw circle" = "draw_circle",
-                "Draw polygon" = "draw_polygon",
-                "Geometry CSV" = "geometry_csv",
-                "Polygon CSV" = "polygon_csv"
-              ),
-              selected = "draw_rectangle",
-              inline = TRUE
-            ),
-            uiOutput("manual_cluster_picker"),
-            conditionalPanel(
-              "['draw_rectangle', 'draw_circle', 'draw_polygon'].indexOf(input.manual_roi_method) >= 0",
-              fluidRow(
-                column(4, uiOutput("roi_editor_section_picker")),
-                column(4, textInput("roi_editor_id", "ROI label", value = "roi_manual_1")),
-                column(
-                  4,
-                  conditionalPanel(
-                    "input.manual_roi_method == 'draw_circle'",
-                    numericInput("roi_circle_radius", "Circle radius (x/y units)", value = 500, min = 0.001)
-                  )
-                )
-              ),
-              tags$small("Rectangle: drag a box. Circle: click its center. Polygon: click boundary vertices in order."),
-              plotOutput(
-                "roi_editor_plot",
-                height = 560,
-                click = "roi_editor_click",
-                brush = brushOpts(id = "roi_editor_brush", resetOnNew = TRUE)
-              ),
-              fluidRow(
-                column(3, actionButton("add_manual_roi", "Add / finish ROI", class = "btn-primary")),
-                column(3, actionButton("undo_roi_vertex", "Undo vertex")),
-                column(3, actionButton("remove_last_roi", "Remove last ROI")),
-                column(3, actionButton("clear_manual_rois", "Clear all"))
-              ),
-              verbatimTextOutput("roi_editor_status")
-            ),
-            conditionalPanel(
-              "input.manual_roi_method == 'geometry_csv'",
-              fileInput("manual_geometry_upload", "ROI geometry CSV", accept = ".csv")
-            ),
-            conditionalPanel(
-              "input.manual_roi_method == 'polygon_csv'",
-              fileInput("manual_polygon_upload", "Polygon vertices CSV", accept = ".csv"),
-              radioButtons(
-                "roi_coordinate_space",
-                "ROI coordinate space",
-                choices = c(
-                  "MSI coordinates" = "msi",
-                  "Histology coordinates" = "histology"
-                ),
-                selected = "msi",
-                inline = TRUE
-              ),
-              conditionalPanel(
-                "input.roi_coordinate_space == 'histology'",
-                fileInput("histology_control_points_upload", "H&E control points CSV", accept = ".csv"),
-                tags$small(
-                  "Control points CSV must contain histology_x, histology_y, msi_x, msi_y,",
-                  tags$br(),
-                  "and optional section_id for serial sections."
-                )
-              )
-            )
-          ),
-          fluidRow(
-            column(3, numericInput("grid_size", "grid_size", value = 5, min = 2, max = 20)),
-            column(3, numericInput("min_pixels", "min_pixels", value = 30, min = 1)),
-            column(
-              6,
-              actionButton("run_roi_sampling", "Confirm ROI & run sampling", class = "btn-primary"),
-              uiOutput("roi_progress"),
-              textOutput("roi_run_status"),
-              verbatimTextOutput("roi_status"),
-              verbatimTextOutput("registration_diagnostics")
-            )
-          ),
-          tags$small("Manual serial ROI files must include section_id. Every mode produces roi_id plus pixel coordinates before sub-region sampling."),
-          tags$br(),
-          tags$small("Plot: gray background = current sidebar ion image; ROI pixels retain their original cluster colors."),
-          plotOutput("subregion_plot", height = 560),
-          downloadButton("download_sample_matrix", "Download sample_matrix.csv"),
-          downloadButton("download_sample_mapping", "Download sample_mapping.csv")
-        ),
-        tabPanel(
-          "7 Export",
-          textOutput("metabo_status"),
-          actionButton("save_metabo_local", "Save export to local folder"),
-          textOutput("metabo_local_path"),
-          downloadButton("download_metabo_csv", "Download metaboanalyst_data.csv"),
-          downloadButton("download_metabo_zip", "Download MetaboAnalyst ZIP"),
-          DTOutput("metabo_preview")
-        ),
-        tabPanel(
-          "8 Import",
-          fileInput("metabo_result", "Upload MetaboAnalyst result", accept = ".csv"),
-          textOutput("result_type"),
-          DTOutput("result_preview")
-        ),
-        tabPanel(
-          "9 Back-map",
-          fluidRow(
-            column(4, uiOutput("result_feature_picker"), uiOutput("score_picker")),
-            column(8, plotOutput("backmap_plot", height = 560))
-          ),
-          fluidRow(
-            column(6, plotOutput("region_boxplot", height = 420)),
-            column(6, plotOutput("score_plot", height = 420))
-          )
-        )
-      )
-    )
-  )
+ui <- navbarPage(
+  id = "workflow_tabs", title = "SpatialOmicsMSI",
+  header = tags$div(class = "alert alert-info", style = "margin:8px",
+    strong("General-purpose spatial metabolomics workflow."),
+    " Example datasets demonstrate complementary modules and are not a matched cohort."),
+  tabPanel("1 Start",
+    radioButtons("entry", NULL, inline = TRUE,
+      choices = c("Start a new analysis" = "new", "Load an example dataset" = "example"), selected = "new"),
+    conditionalPanel("input.entry == 'example'",
+      selectInput("example_key", "Example datasets", choices = setNames(names(example_datasets), vapply(example_datasets, `[[`, "", "label"))),
+      actionButton("load_example", "Use this example", class = "btn-info")),
+    hr(),
+    radioButtons("data_origin", "Input location", inline = TRUE,
+      choices = c("Server files" = "server", "Browser upload" = "upload"), selected = "server"),
+    selectInput("msi_input_type", "Primary MSI input", choices = c("Paired imzML + ibd" = "imzml",
+      "Processed pixel × feature CSV" = "csv", "No MSI (LC-MS/MS only)" = "none")),
+    conditionalPanel("input.data_origin == 'upload' && input.msi_input_type == 'imzml'",
+      fileInput("upload_imzml", "imzML", accept = c(".imzML", ".imzml")), fileInput("upload_ibd", "ibd", accept = c(".ibd", ".IBD"))),
+    conditionalPanel("input.data_origin == 'upload' && input.msi_input_type == 'csv'", fileInput("upload_csv", "Pixel × feature CSV", accept = ".csv")),
+    conditionalPanel("input.data_origin == 'upload'",
+      fileInput("upload_optical", "Optional optical/H&E/brightfield JPEG", accept = c(".jpg", ".jpeg")),
+      fileInput("upload_transform", "Optional registration transform JSON", accept = ".json"),
+      fileInput("upload_labels", "Optional ROI/domain CSV", accept = ".csv"),
+      fileInput("upload_lcms", "Optional LC-MS/MS mzML", accept = c(".mzML", ".mzml"))),
+    tags$details(tags$summary("Technical details — server paths"),
+      conditionalPanel("input.data_origin == 'server' && input.msi_input_type == 'imzml'",
+        textInput("server_imzml", "imzML path"), textInput("server_ibd", "ibd path")),
+      conditionalPanel("input.data_origin == 'server' && input.msi_input_type == 'csv'", textInput("server_csv", "Pixel × feature CSV path")),
+      conditionalPanel("input.data_origin == 'server'",
+        textInput("server_optical", "Optional optical JPEG path"), textInput("server_transform", "Optional transform JSON path"),
+        textInput("server_labels", "Optional ROI/domain CSV path"), textInput("server_lcms", "Optional LC-MS/MS mzML path"),
+        textInput("server_attribution", "Optional attribution metadata path"))),
+    fluidRow(column(4, textInput("sample_id", "Sample ID")), column(4, textInput("section_id", "Section ID")),
+      column(4, textInput("subject_id", "Biological subject ID"))),
+    fluidRow(column(4, selectInput("ion_mode", "Ion mode", c("Positive" = "positive", "Negative" = "negative"))),
+      column(8, textInput("ion_mode_source", "Ion-mode metadata source", placeholder = "e.g. acquisition record; inferred from adducts"))),
+    tags$details(tags$summary("Processing parameters"),
+      selectInput("spectral_processing", "Spectral processing", c("Align stored processed peak lists" = "processed_peak_lists", "Profile peakPick(diff) then align" = "profile_diff")),
+      numericInput("alignment_ppm", "Alignment tolerance (ppm)", 10, min = .01),
+      numericInput("peak_pick_snr", "Profile peak-picking SNR", 6, min = 0),
+      numericInput("min_detection_fraction", "Minimum detection fraction", 0, min = 0, max = 1, step = .01),
+      checkboxInput("make_tissue_mask", "Build transparent TIC/peak-count tissue mask", FALSE)),
+    actionButton("validate_input", "Validate input", class = "btn-primary"),
+    uiOutput("validation_card"), uiOutput("continue_processing"),
+    tags$details(tags$summary("Technical details — validated files and metadata"), DTOutput("technical_files"), DTOutput("input_metadata"))
+  ),
+  tabPanel("2 Input & provenance", uiOutput("module_overview"), DTOutput("provenance_table"), textOutput("source_note")),
+  tabPanel("3 Processing & QC", checkboxInput("tic_normalize", "TIC normalization", TRUE),
+    checkboxInput("log1p_transform", "log10(x + 1) transformation", TRUE), uiOutput("processing_action"),
+    uiOutput("processing_gate"), DTOutput("qc_table"), DTOutput("feature_preview"),
+    plotOutput("tissue_mask_plot", height = 600), DTOutput("tissue_mask_diagnostics"), uiOutput("tissue_download")),
+  tabPanel("4 Brightfield–MSI registration", uiOutput("registration_action"), uiOutput("registration_gate"),
+    imageOutput("registration_plot", height = "650px"), DTOutput("registration_diagnostics")),
+  tabPanel("5 Spatial domains", fileInput("domain_csv_runtime", "Add/replace ROI/domain CSV", accept = ".csv"),
+    numericInput("domain_k", "Exploratory domain count k", 4, min = 2, max = 12),
+    numericInput("domain_seed", "Random seed", 20260808, min = 1), numericInput("domain_pcs", "PCA components", 10, min = 2, max = 30),
+    uiOutput("domain_action"), tags$div(class = "alert alert-warning",
+      "Pseudoreplication warning: pixels are not biological replicates. Generated domains are descriptive and data-driven, never anatomical ROI."),
+    uiOutput("domain_gate"), plotOutput("domain_plot", height = 600), DTOutput("domain_counts"), DTOutput("domain_features"), uiOutput("domain_download")),
+  tabPanel("6 Moran's I", selectInput("neighbor_method", "Adjacency", c("Queen" = "queen", "Rook" = "rook")),
+    numericInput("permutations", "Two-sided permutations", 499, min = 99, step = 100), uiOutput("moran_action"),
+    tags$details(tags$summary("Technical details — load a previously generated result"),
+      textInput("moran_result_dir", "Result directory", Sys.getenv("SPATIALOMICS_OMIX_MORAN_DIR", "")), actionButton("load_moran", "Load result")),
+    uiOutput("moran_gate"), DTOutput("neighbor_table"), DTOutput("moran_table"), plotOutput("ion_plot", height = 600)),
+  tabPanel("7 LC-MS/MS evidence", numericInput("msi_mz", "MSI observed m/z", 775.55261535, step = .00000001),
+    numericInput("lcms_precursor", "LC-MS/MS precursor target", 775.550137928655, step = .000000000001), uiOutput("lcms_action"),
+    tags$p("Precursor-level match and an unassigned fragment spectrum are shown. Chemical identity is never inferred without user-supplied diagnostic-ion definitions."),
+    uiOutput("lcms_gate"), DTOutput("precursor_table"), plotOutput("fragment_plot", height = 520)),
+  tabPanel("8 Download results", tags$p("Each session writes to a unique temporary directory; source data are read-only."),
+    uiOutput("download_gate"), downloadButton("download_bundle", "Download session bundle"),
+    tags$details(tags$summary("Technical details — temporary session location"), textOutput("session_path")))
 )
 
 server <- function(input, output, session) {
-  last_thumbnail_dblclick <- reactiveVal(list(feature = NULL, time = as.POSIXct(0, origin = "1970-01-01")))
-  manual_selected <- reactiveVal(character())
-  roi_run_status <- reactiveVal("Not run yet")
-  registration_info <- reactiveVal(NULL)
-  last_metabo_export_path <- reactiveVal(NULL)
-  extraction_status <- reactiveVal("Idle")
-  extraction_progress_state <- reactiveVal(NULL)
-  selection_run_status <- reactiveVal("Not run yet")
-  preprocess_run_status <- reactiveVal("Not run yet")
-  cluster_run_status <- reactiveVal("Not run yet")
-  roi_run_status <- reactiveVal("Not run yet")
-  selection_progress_state <- reactiveVal(NULL)
-  preprocess_progress_state <- reactiveVal(NULL)
-  cluster_progress_state <- reactiveVal(NULL)
-  roi_progress_state <- reactiveVal(NULL)
-  existing_outputs <- reactiveVal(load_output_bundle(DEFAULT_OUTPUT_DIR, DEFAULT_VIP_FILE))
-  drawn_geometry <- reactiveVal(data.frame(
-    section_id = character(), roi_id = character(), shape = character(),
-    x_min = numeric(), x_max = numeric(), y_min = numeric(), y_max = numeric(),
-    center_x = numeric(), center_y = numeric(), size = numeric(), radius = numeric(),
-    definition_order = integer(), stringsAsFactors = FALSE
-  ))
-  drawn_polygons <- reactiveVal(data.frame(
-    section_id = character(), roi_id = character(), vertex_order = integer(),
-    x = numeric(), y = numeric(), definition_order = integer(), stringsAsFactors = FALSE
-  ))
-  draft_polygon <- reactiveVal(data.frame(x = numeric(), y = numeric()))
-  circle_center <- reactiveVal(NULL)
-  next_roi_order <- reactiveVal(1L)
+  state <- reactiveValues(valid = FALSE, spec = NULL, validation = NULL, processed = NULL,
+    analysis_matrix = NULL, tissue_gate = NULL, tissue_mask = NULL, registration = NULL,
+    domains = NULL, domain_counts = NULL, domain_features = NULL, neighbors = NULL,
+    moran = NULL, lcms = NULL, example_note = NULL)
+  session_dir <- file.path(session_root, paste0("SpatialOmicsMSI-session-", Sys.getpid(), "-", substr(session$token, 1, 8)))
+  dir.create(session_dir, recursive = TRUE, showWarnings = FALSE)
+  output$session_path <- renderText(session_dir)
 
-  update_stage_progress <- function(holder, value, detail, state = "running") {
-    holder(list(
-      value = max(0, min(1, as.numeric(value))),
-      detail = as.character(detail),
-      state = state
-    ))
+  upload_path <- function(value) if (is.null(value)) "" else value$datapath
+  current_spec <- reactive({
+    server <- identical(input$data_origin, "server")
+    list(msi_input_type = input$msi_input_type,
+      imzml_path = if (server) input$server_imzml %or% "" else upload_path(input$upload_imzml),
+      ibd_path = if (server) input$server_ibd %or% "" else upload_path(input$upload_ibd),
+      csv_path = if (server) input$server_csv %or% "" else upload_path(input$upload_csv),
+      optical_path = if (server) input$server_optical %or% "" else upload_path(input$upload_optical),
+      transform_path = if (server) input$server_transform %or% "" else upload_path(input$upload_transform),
+      labels_path = if (server) input$server_labels %or% "" else upload_path(input$upload_labels),
+      lcms_path = if (server) input$server_lcms %or% "" else upload_path(input$upload_lcms),
+      attribution_path = if (server) input$server_attribution %or% "" else "",
+      sample_id = input$sample_id %or% "", section_id = input$section_id %or% "",
+      subject_id = input$subject_id %or% "", ion_mode = input$ion_mode %or% "",
+      ion_mode_source = input$ion_mode_source %or% "", spectral_processing = input$spectral_processing,
+      alignment_ppm = input$alignment_ppm, peak_pick_snr = input$peak_pick_snr,
+      min_detection_fraction = input$min_detection_fraction, make_tissue_mask = isTRUE(input$make_tissue_mask))
+  })
+
+  reset_analysis <- function() {
+    state$valid <- FALSE; state$validation <- NULL; state$processed <- NULL; state$analysis_matrix <- NULL
+    state$tissue_gate <- NULL; state$tissue_mask <- NULL; state$registration <- NULL
+    state$domains <- NULL; state$neighbors <- NULL; state$moran <- NULL; state$lcms <- NULL
   }
 
-  stage_progress_ui <- function(progress) {
-    if (is.null(progress)) return(NULL)
-    percent <- round(100 * progress$value)
-    bar_class <- switch(
-      progress$state,
-      success = "progress-bar progress-bar-success",
-      failed = "progress-bar progress-bar-danger",
-      "progress-bar progress-bar-info progress-bar-striped active"
-    )
-    tags$div(
-      style = "margin-top:10px; margin-bottom:6px;",
-      tags$div(
-        class = "progress",
-        style = "height:26px; margin-bottom:4px;",
-        tags$div(
-          class = bar_class,
-          role = "progressbar",
-          `aria-valuenow` = percent,
-          `aria-valuemin` = 0,
-          `aria-valuemax` = 100,
-          style = sprintf("width:%s%%; min-width:3em; line-height:26px;", percent),
-          paste0(percent, "%")
-        )
-      ),
-      tags$small(progress$detail)
-    )
-  }
-
-  output$selection_progress <- renderUI(stage_progress_ui(selection_progress_state()))
-  output$extraction_progress <- renderUI(stage_progress_ui(extraction_progress_state()))
-  output$preprocess_progress <- renderUI(stage_progress_ui(preprocess_progress_state()))
-  output$cluster_progress <- renderUI(stage_progress_ui(cluster_progress_state()))
-  output$roi_progress <- renderUI(stage_progress_ui(roi_progress_state()))
-
-  observeEvent(list(
-    input$cv_top, input$mean_min, input$nonzero_min, input$combine_mode,
-    input$min_section_fraction
-  ), {
-    selection_run_status("Settings changed — click Confirm & run feature selection")
-  }, ignoreInit = TRUE)
-  observeEvent(manual_selected(), {
-    selection_run_status("Feature choices changed — click Confirm & run feature selection")
-  }, ignoreInit = TRUE)
-  observeEvent(list(
-    input$do_background, input$background_method, input$background_percent,
-    input$background_percentile, input$min_nonzero_features,
-    input$do_tic, input$do_log, input$do_scale
-  ), {
-    preprocess_run_status("Settings changed — click Confirm & run preprocessing")
-  }, ignoreInit = TRUE)
-  observeEvent(list(input$k, input$use_pca_cluster, input$pca_components), {
-    cluster_run_status("Settings changed — click Confirm & run K-means")
-  }, ignoreInit = TRUE)
-  observeEvent(list(
-    input$roi_selection_mode, input$manual_roi_method, input$manual_roi_clusters,
-    input$roi_size, input$roi_shape, input$max_rois, input$roi_tau,
-    input$balance_weight, input$coverage_weight, input$size_weight,
-    input$grid_size, input$min_pixels
-  ), {
-    roi_run_status("ROI settings changed — click Confirm ROI & run sampling")
-  }, ignoreInit = TRUE)
-  observeEvent(list(drawn_geometry(), drawn_polygons()), {
-    roi_run_status("Drawn ROI changed — click Confirm ROI & run sampling")
-  }, ignoreInit = TRUE)
-
-  observeEvent(input$reload_existing_outputs, {
-    existing_outputs(load_output_bundle(input$existing_output_dir, input$existing_vip_file))
-  }, ignoreInit = TRUE)
-
-  existing <- reactive({
-    if (!isTRUE(input$use_existing_outputs)) return(NULL)
-    existing_outputs()
+  observeEvent(input$load_example, {
+    p <- preset_spec(input$example_key); reset_analysis(); state$example_note <- p$source_note
+    updateRadioButtons(session, "data_origin", selected = "server")
+    updateSelectInput(session, "msi_input_type", selected = p$msi_input_type)
+    fields <- c(imzml = "server_imzml", ibd = "server_ibd", csv = "server_csv", optical = "server_optical",
+      transform = "server_transform", labels = "server_labels", lcms = "server_lcms", attribution = "server_attribution")
+    for (name in names(fields)) updateTextInput(session, fields[[name]], value = p[[paste0(name, "_path")]] %or% "")
+    for (name in c("sample_id", "section_id", "subject_id", "ion_mode_source")) updateTextInput(session, name, value = p[[name]])
+    updateSelectInput(session, "ion_mode", selected = p$ion_mode)
+    updateSelectInput(session, "spectral_processing", selected = p$spectral_processing)
+    updateNumericInput(session, "alignment_ppm", value = p$alignment_ppm)
+    updateNumericInput(session, "peak_pick_snr", value = p$peak_pick_snr)
+    updateNumericInput(session, "min_detection_fraction", value = p$min_detection_fraction)
+    updateCheckboxInput(session, "make_tissue_mask", value = p$make_tissue_mask)
   })
 
-  output$existing_output_status <- renderText({
-    bundle <- existing_outputs()
-    pm <- bundle$pixel_matrix
-    sm <- bundle$sample_matrix
-    vip <- bundle$vip
-    paste(
-      sprintf("pixel matrix: %s", if (is.null(pm)) "missing" else paste(nrow(pm), "pixels")),
-      sprintf("sample matrix: %s", if (is.null(sm)) "missing" else paste(nrow(sm), "samples")),
-      sprintf("section mapping: %s", if (is.null(bundle$section_mapping)) "missing" else paste(nrow(bundle$section_mapping), "sections")),
-      sprintf("VIP result: %s", if (is.null(vip)) "missing" else paste(nrow(vip), "features")),
-      sep = "\n"
-    )
+  observeEvent(input$validate_input, {
+    reset_analysis(); state$spec <- current_spec()
+    state$validation <- withProgress(message = "Checking input metadata", value = .2, {
+      out <- validate_analysis_spec(state$spec, inspect = TRUE); incProgress(.8); out
+    })
+    state$valid <- state$validation$valid
   })
 
-  write_metabo_export_files <- function(output_dir) {
-    ma_data <- metabo_data()
-    smap <- sampled()$sample_mapping
-    fmap <- feature_mapping()
-    section_map <- section_mapping()
-    bg_stats <- preprocessed()$background_stats
-    validate(
-      need(nrow(ma_data) > 0, "No MetaboAnalyst data to export."),
-      need(nrow(smap) > 0, "No sample mapping to export."),
-      need(nrow(fmap) > 0, "No feature mapping to export.")
-    )
+  output$validation_card <- renderUI({
+    if (is.null(state$validation)) return(tags$div(class = "alert alert-secondary", "Choose inputs and validate them before continuing."))
+    if (!state$validation$valid) return(tags$div(class = "alert alert-danger", strong("Input needs attention."),
+      tags$ul(lapply(state$validation$errors, tags$li))))
+    caps <- names(Filter(isTRUE, state$validation$capabilities))
+    tags$div(class = "alert alert-success", strong("Input is ready."),
+      tags$p("File pairing, format and coordinate metadata passed the available checks."),
+      tags$p("Available workflow modules: ", paste(caps, collapse = ", "), "."),
+      if (length(state$validation$notes)) tags$ul(lapply(state$validation$notes, tags$li)))
+  })
+  output$continue_processing <- renderUI(if (isTRUE(state$valid) && isTRUE(state$validation$capabilities$msi))
+    actionButton("continue_button", "Continue to Processing", class = "btn-success") else NULL)
+  observeEvent(input$continue_button, updateNavbarPage(session, "workflow_tabs", selected = "3 Processing & QC"))
+  output$technical_files <- renderDT({ req(state$validation); files <- state$validation$files
+    if (!length(files)) return(datatable(data.frame(message = "No files"), options = list(dom = "t")))
+    roles <- names(files); if (is.null(roles) || !length(roles) || all(!nzchar(roles))) roles <- paste0("file_", seq_along(files))
+    datatable(data.frame(role = roles, path = files,
+      bytes = file.info(files)$size, md5 = unname(tools::md5sum(files))), options = list(pageLength = 5, scrollX = TRUE)) })
+  output$input_metadata <- renderDT({ req(state$validation); d <- state$validation$metadata$summary
+    if (is.null(d)) d <- data.frame(item = "Input type", value = state$spec$msi_input_type)
+    datatable(d, options = list(dom = "t")) })
+  output$module_overview <- renderUI({
+    if (!isTRUE(state$valid)) return(tags$div(class = "alert alert-warning", "Validate input on the Start page first."))
+    c <- state$validation$capabilities
+    tags$div(class = "alert alert-info", paste(names(c), ifelse(unlist(c), "available", "not supplied"), collapse = " · "))
+  })
+  output$source_note <- renderText(state$example_note %or% "User-supplied dataset; attribution and study design remain the user's responsibility.")
+  output$provenance_table <- renderDT({ req(state$valid); s <- state$spec
+    datatable(data.frame(field = c("sample_id", "section_id", "subject_id", "ion_mode", "ion_mode_source", "input_type"),
+      value = c(s$sample_id, s$section_id, s$subject_id, s$ion_mode, s$ion_mode_source, s$msi_input_type)), options = list(dom = "t")) })
 
-    dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
-    paths <- c(
-      data = file.path(output_dir, "metaboanalyst_data.csv"),
-      samples = file.path(output_dir, "sample_mapping.csv"),
-      features = file.path(output_dir, "feature_mapping.csv")
-    )
-    if (!is.null(section_map) && nrow(section_map) > 0) {
-      paths <- c(paths, sections = file.path(output_dir, "section_mapping.csv"))
-    }
-    if (!is.null(bg_stats) && nrow(bg_stats) > 0) {
-      paths <- c(paths, background = file.path(output_dir, "background_stats.csv"))
-    }
-    write.csv(ma_data, paths[["data"]], row.names = FALSE)
-    write.csv(smap, paths[["samples"]], row.names = FALSE)
-    write.csv(fmap, paths[["features"]], row.names = FALSE)
-    if ("sections" %in% names(paths)) write.csv(section_map, paths[["sections"]], row.names = FALSE)
-    if ("background" %in% names(paths)) write.csv(bg_stats, paths[["background"]], row.names = FALSE)
-
-    zip_path <- file.path(output_dir, "metaboanalyst_export.zip")
-    zip::zipr(
-      zipfile = zip_path,
-      files = basename(paths),
-      root = output_dir,
-      recurse = FALSE,
-      compression_level = 0,
-      include_directories = FALSE,
-      mode = "cherry-pick"
-    )
-
-    c(paths, zip = zip_path)
-  }
-
-  output$extraction_status <- renderText(extraction_status())
-
-  extracted <- eventReactive(input$extract, {
-    extraction_status("Starting extraction...")
-    update_stage_progress(extraction_progress_state, 0.01, "Starting imzML extraction")
-    tryCatch(
-      withProgress(message = "Extracting MSI features", value = 0, {
-        local_feature_path <- trimws(input$local_features_path %||% "")
-        mzmine <- if (nzchar(local_feature_path)) {
-          validate(need(file.exists(local_feature_path), "Local feature CSV does not exist."))
-          read.csv(local_feature_path, check.names = FALSE, stringsAsFactors = FALSE)
+  output$processing_action <- renderUI(if (isTRUE(state$valid) && isTRUE(state$validation$capabilities$processing))
+    actionButton("run_processing", "Run processing", class = "btn-primary") else tags$div(class = "alert alert-secondary", "Processing is available after validating MSI input."))
+  observeEvent(input$run_processing, {
+    req(state$valid); s <- state$spec
+    withProgress(message = "Preparing MSI", value = 0, {
+      if (identical(s$msi_input_type, "csv")) {
+        state$processed <- read_pixel_feature_csv(s$csv_path, s$sample_id, s$section_id, s$subject_id)
+      } else {
+        layout <- state$validation$metadata$mz_layout
+        if (identical(layout, "shared")) {
+          state$processed <- load_shared_axis_pair(s$imzml_path, s$ibd_path, s$sample_id, s$section_id,
+            s$ion_mode, s$ion_mode_source)
         } else {
-          req(input$features)
-          read_csv_upload(input$features)
+          state$processed <- load_variable_mz_msi_features(s$imzml_path, s$ibd_path,
+            s$sample_id, s$section_id, s$ion_mode, s$ion_mode_source,
+            processing = s$spectral_processing, alignment_ppm = s$alignment_ppm,
+            peak_pick_snr = s$peak_pick_snr, min_detection_fraction = s$min_detection_fraction,
+            progress_callback = function(value, detail) incProgress(value, detail = detail))
         }
-        setProgress(0.01, detail = "Feature list loaded")
-        update_stage_progress(extraction_progress_state, 0.01, "Feature list loaded")
-
-        local_paths_text <- trimws(input$local_imzml_path %||% "")
-        imzml_paths <- if (nzchar(local_paths_text)) {
-          paths <- trimws(unlist(strsplit(local_paths_text, "[\r\n;]+")))
-          paths <- paths[nzchar(paths)]
-          validate(need(length(paths) > 0, "Enter at least one local .imzML path."))
-          validate(need(all(file.exists(paths)), "One or more local .imzML paths do not exist."))
-          validate(need(all(tolower(tools::file_ext(paths)) == "imzml"), "Local paths must point to .imzML files."))
-          if (!identical(input$input_mode, "serial")) {
-            validate(need(length(paths) == 1, "Single-section mode accepts exactly one .imzML path."))
-          }
-          paths
-        } else {
-          req(input$msi_files)
-          extraction_status("Copying uploaded imzML/ibd files to a matched temporary directory...")
-          setProgress(0.02, detail = "Preparing uploaded imzML/ibd files")
-          update_stage_progress(extraction_progress_state, 0.02, "Preparing uploaded imzML/ibd files")
-          if (identical(input$input_mode, "serial")) {
-            preserve_uploaded_serial_msi_files(input$msi_files)
-          } else {
-            preserve_uploaded_msi_files(input$msi_files)
-          }
-        }
-
-        missing_ibd <- vapply(imzml_paths, function(path) {
-          stem <- tools::file_path_sans_ext(basename(path))
-          companions <- list.files(dirname(path), full.names = TRUE)
-          !any(tolower(tools::file_ext(companions)) == "ibd" &
-                 tolower(tools::file_path_sans_ext(basename(companions))) == tolower(stem))
-        }, logical(1))
-        validate(need(!any(missing_ibd), paste0(
-          "Missing matching .ibd file for: ",
-          paste(basename(imzml_paths[missing_ibd]), collapse = ", ")
-        )))
-
-        progress_callback <- function(value, detail) {
-          value <- max(0, min(1, as.numeric(value)))
-          extraction_status(paste0(detail, " (", round(100 * value), "%)"))
-          setProgress(value, detail = detail)
-          update_stage_progress(extraction_progress_state, value, detail)
-        }
-        result <- if (identical(input$input_mode, "serial")) {
-          load_serial_msi_target_features(
-            imzml_paths, mzmine, ppm = input$ppm,
-            progress_callback = progress_callback
-          )
-        } else {
-          load_msi_target_features(
-            imzml_paths, mzmine, ppm = input$ppm,
-            progress_callback = progress_callback
-          )
-        }
-        extraction_status(paste0("Complete: ", nrow(result$pixel_matrix), " pixels extracted."))
-        update_stage_progress(extraction_progress_state, 1, "imzML extraction complete", "success")
-        result
-      }),
-      error = function(e) {
-        error_message <- conditionMessage(e)
-        update_stage_progress(extraction_progress_state, 1, paste0("Failed: ", error_message), "failed")
-        extraction_status(paste0("Extraction failed: ", error_message))
-        showNotification(error_message, type = "error", duration = NULL)
-        stop(error_message, call. = FALSE)
       }
-    )
+      feature_names <- state$processed$feature_metadata$column_name
+      matrix <- as.matrix(state$processed$pixel_feature_matrix[, feature_names, drop = FALSE]); storage.mode(matrix) <- "double"
+      tic <- rowSums(matrix, na.rm = TRUE); analysis <- matrix
+      if (isTRUE(input$tic_normalize)) analysis <- analysis / pmax(tic, .Machine$double.eps)
+      if (isTRUE(input$log1p_transform)) analysis <- log10(analysis + 1)
+      state$analysis_matrix <- analysis; state$tic <- tic
+      if (isTRUE(s$make_tissue_mask)) {
+        pq <- state$processed$pixel_qc
+        if (is.null(pq)) pq <- data.frame(state$processed$coordinates, raw_tic = tic,
+          raw_peak_count = rowSums(is.finite(matrix) & matrix > 0))
+        state$tissue_gate <- build_msi_tissue_mask(state$processed$coordinates, pq$raw_tic, pq$raw_peak_count,
+          "kmeans_log_tic_peak_count", seed = 20260808)
+        state$tissue_mask <- state$tissue_gate$mask$tissue
+        write.csv(state$tissue_gate$mask, file.path(session_dir, "tissue_mask.csv"), row.names = FALSE)
+        write.csv(state$tissue_gate$diagnostics, file.path(session_dir, "tissue_mask_parameters.csv"), row.names = FALSE)
+      } else state$tissue_mask <- rep(TRUE, nrow(analysis))
+      write.csv(state$processed$qc_summary, file.path(session_dir, "qc_summary.csv"), row.names = FALSE)
+      write.csv(state$processed$feature_metadata, file.path(session_dir, "feature_metadata.csv"), row.names = FALSE)
+      write.csv(state$processed$coordinates, file.path(session_dir, "coordinates.csv"), row.names = FALSE)
+      write.csv(state$processed$provenance, file.path(session_dir, "provenance_manifest.csv"), row.names = FALSE)
+      write.csv(data.frame(tic_normalization = isTRUE(input$tic_normalize),
+        log_transform = if (isTRUE(input$log1p_transform)) "log10(x + 1)" else "none",
+        alignment_ppm = s$alignment_ppm, peak_pick_snr = s$peak_pick_snr,
+        min_detection_fraction = s$min_detection_fraction), file.path(session_dir, "processing_parameters.csv"), row.names = FALSE)
+    })
   })
+  output$processing_gate <- renderUI(if (is.null(state$processed)) tags$div(class = "alert alert-warning", "No processed MSI is available yet.")
+    else tags$div(class = "alert alert-success", "Processing completed. The full matrix remains in this R session; the browser receives previews only."))
+  output$qc_table <- renderDT({ req(state$processed); datatable(state$processed$qc_summary, options = list(dom = "t", scrollX = TRUE)) })
+  output$feature_preview <- renderDT({ req(state$processed); datatable(head(state$processed$feature_metadata, 25), options = list(pageLength = 10)) })
+  output$tissue_mask_plot <- renderPlot({ req(state$tissue_gate); d <- state$tissue_gate$mask
+    ggplot(d, aes(x, y, color = tissue_status)) + geom_point(size = .7) + coord_equal() + scale_y_reverse() +
+      scale_color_manual(values = c("tissue" = "#2166AC", "unclassified/background" = "#D9D9D9")) + theme_minimal() +
+      labs(title = "Full acquisition field and reproducible tissue gate") })
+  output$tissue_mask_diagnostics <- renderDT({ req(state$tissue_gate); datatable(state$tissue_gate$diagnostics, options = list(dom = "t", scrollX = TRUE)) })
+  output$tissue_download <- renderUI(if (!is.null(state$tissue_gate)) downloadButton("download_tissue_mask", "Download tissue mask") else NULL)
+  output$download_tissue_mask <- downloadHandler(filename = function() "tissue_mask.csv", content = function(file) {
+    req(state$tissue_gate); write.csv(state$tissue_gate$mask, file, row.names = FALSE) })
 
-  pixel_matrix <- reactive({
-    uploaded <- read_csv_upload(input$pixel_matrix_upload)
-    if (!is.null(uploaded)) return(uploaded)
-    if (!is.null(input$extract) && input$extract > 0) {
-      result <- extracted()
-      if (!is.null(result$pixel_matrix)) return(result$pixel_matrix)
-    }
-    bundle <- existing()
-    if (!is.null(bundle) && !is.null(bundle$pixel_matrix)) return(bundle$pixel_matrix)
-    extracted()$pixel_matrix
+  output$registration_action <- renderUI({
+    if (!isTRUE(state$valid) || !isTRUE(state$validation$capabilities$registration))
+      return(tags$div(class = "alert alert-secondary", "Registration is disabled. Supply MSI, an optical JPEG and a compatible 3 × 3 transform JSON."))
+    if (is.null(state$processed)) return(tags$div(class = "alert alert-warning", "Process MSI before registration."))
+    actionButton("run_registration", "Apply supplied transform", class = "btn-primary")
   })
-
-  feature_mapping <- reactive({
-    uploaded <- read_csv_upload(input$feature_mapping_upload)
-    if (!is.null(uploaded)) return(uploaded)
-    if (!is.null(input$extract) && input$extract > 0) {
-      result <- extracted()
-      if (!is.null(result$feature_mapping)) return(result$feature_mapping)
-    }
-    bundle <- existing()
-    if (!is.null(bundle) && !is.null(bundle$feature_mapping)) return(bundle$feature_mapping)
-    pm <- read_csv_upload(input$pixel_matrix_upload)
-    if (!is.null(pm)) return(infer_feature_mapping(pm))
-    extracted()$feature_mapping
+  observeEvent(input$run_registration, {
+    req(state$processed); s <- state$spec
+    state$registration <- register_metaspace_optical(state$processed$coordinates, s$transform_path,
+      s$optical_path, if (present_path(s$attribution_path)) s$attribution_path else NULL, tic = state$tic,
+      representative_ions = { m <- state$analysis_matrix; ii <- head(order(apply(m, 2, var), decreasing = TRUE), 3)
+        stats::setNames(lapply(ii, function(j) m[, j]), format(state$processed$feature_metadata$mz[ii], digits = 9)) },
+      output_dir = file.path(session_dir, "live_registration"))
+    state$registration$diagnostics$diagnostic_source <- "live run using user-supplied optical image, transform and current MSI"
+    write.csv(state$registration$registered_coordinates, file.path(session_dir, "registered_coordinates.csv"), row.names = FALSE)
   })
+  output$registration_gate <- renderUI(if (is.null(state$registration)) NULL else tags$div(class = "alert alert-success",
+    "Transform applied exactly as supplied; coordinate origin was inferred from current MSI minima and no implicit y inversion was introduced."))
+  output$registration_diagnostics <- renderDT({ req(state$registration); datatable(state$registration$diagnostics, options = list(dom = "t")) })
+  output$registration_plot <- renderImage({ req(state$registration); src <- unname(state$registration$output_files["measurement_mask_overlay"])
+    list(src = src, contentType = "image/png", alt = "Live registered measurement mask") }, deleteFile = FALSE)
 
-  section_mapping <- reactive({
-    if (!is.null(input$extract) && input$extract > 0) {
-      result <- extracted()
-      if (!is.null(result$section_mapping)) return(result$section_mapping)
-    }
-    bundle <- existing()
-    if (!is.null(bundle) && !is.null(bundle$section_mapping)) return(bundle$section_mapping)
-    result <- extracted()
-    if (!is.null(result$section_mapping)) return(result$section_mapping)
-    pm <- pixel_matrix()
-    if (all(c("section_id", "section_order") %in% names(pm))) {
-      unique(pm[, c("section_id", "section_order"), drop = FALSE])
-    } else {
-      data.frame()
-    }
+  observeEvent(input$domain_csv_runtime, {
+    req(state$processed); info <- validate_label_file(input$domain_csv_runtime$datapath)
+    state$domains <- resolve_label_mapping(info, state$processed$coordinates, state$spec$sample_id, state$spec$section_id)
+    state$domain_counts <- as.data.frame(table(state$domains$domain_label)); names(state$domain_counts) <- c("domain", "pixel_count")
   })
-
-  output$loaded_summary <- renderPrint({
-    bundle <- existing_outputs()
-    cat("Output folder:", bundle$output_dir, "\n")
-    cat("VIP file:", bundle$vip_file, "\n\n")
-    cat("pixel_feature_matrix:", if (is.null(bundle$pixel_matrix)) "missing" else paste(nrow(bundle$pixel_matrix), "rows x", ncol(bundle$pixel_matrix), "columns"), "\n")
-    cat("feature_mapping:", if (is.null(bundle$feature_mapping)) "missing" else paste(nrow(bundle$feature_mapping), "features"), "\n")
-    cat("section_mapping:", if (is.null(bundle$section_mapping)) "missing" else paste(nrow(bundle$section_mapping), "sections"), "\n")
-    cat("selected_features:", if (is.null(bundle$selected_features)) "missing" else paste(nrow(bundle$selected_features), "features"), "\n")
-    cat("sample_matrix:", if (is.null(bundle$sample_matrix)) "missing" else paste(nrow(bundle$sample_matrix), "samples"), "\n")
-    cat("metaboanalyst_data:", if (is.null(bundle$metaboanalyst_data)) "missing" else paste(nrow(bundle$metaboanalyst_data), "samples"), "\n")
+  output$domain_action <- renderUI({
+    if (!isTRUE(state$valid) || !isTRUE(state$validation$capabilities$domains))
+      return(tags$div(class = "alert alert-secondary", "Domain analysis is disabled until MSI input is validated."))
+    if (is.null(state$processed)) return(tags$div(class = "alert alert-warning", "Process MSI first."))
+    tagList(actionButton("load_spec_labels", "Use validated ROI/domain labels"),
+      actionButton("generate_domains", "Generate exploratory metabolic domains", class = "btn-primary"))
   })
-
-  output$pixel_preview <- renderDT({
-    datatable(head(pixel_matrix(), 20), options = list(scrollX = TRUE, pageLength = 5))
+  observeEvent(input$load_spec_labels, {
+    validate(need(isTRUE(state$validation$capabilities$labels), "No validated ROI/domain CSV was supplied."))
+    state$domains <- resolve_label_mapping(state$validation$labels, state$processed$coordinates, state$spec$sample_id, state$spec$section_id)
+    state$domain_counts <- as.data.frame(table(state$domains$domain_label)); names(state$domain_counts) <- c("domain", "pixel_count")
   })
-
-  output$feature_picker <- renderUI({
-    columns <- feature_columns(pixel_matrix())
-    choices <- setNames(columns, sub("^mz_", "", columns))
-    selectInput("feature", "Feature m/z", choices = choices)
+  observeEvent(input$generate_domains, {
+    req(state$processed, state$analysis_matrix); keep_tissue <- if (is.null(state$tissue_mask)) rep(TRUE, nrow(state$analysis_matrix)) else state$tissue_mask
+    matrix <- state$analysis_matrix[keep_tissue, , drop = FALSE]; keep <- apply(matrix, 2, var) > 0
+    validate(need(sum(keep) >= 2, "At least two non-zero-variance features are required."))
+    pc <- prcomp(matrix[, keep, drop = FALSE], center = TRUE, scale. = TRUE); npc <- min(input$domain_pcs, ncol(pc$x))
+    set.seed(input$domain_seed); km <- kmeans(pc$x[, seq_len(npc), drop = FALSE], centers = input$domain_k, nstart = 25)
+    ids <- rep(-1L, nrow(state$analysis_matrix)); ids[keep_tissue] <- km$cluster - 1L
+    state$domains <- data.frame(state$processed$coordinates, tissue_status = ifelse(keep_tissue, "tissue", "unclassified/background"),
+      domain_id = ids, domain_label = ifelse(ids == -1L, "unclassified/background", paste0("data-driven exploratory metabolic domain ", ids)))
+    state$domain_counts <- as.data.frame(table(state$domains$domain_label)); names(state$domain_counts) <- c("domain", "pixel_count")
+    between <- vapply(seq_len(ncol(matrix)), function(j) var(tapply(matrix[, j], km$cluster, mean)), numeric(1)); order <- head(order(between, decreasing = TRUE), 25)
+    state$domain_features <- data.frame(feature = state$processed$feature_metadata$column_name[order],
+      mz = state$processed$feature_metadata$mz[order], between_domain_variance = between[order])
+    write.csv(state$domains, file.path(session_dir, "exploratory_metabolic_domains.csv"), row.names = FALSE)
+    write.csv(data.frame(k = input$domain_k, seed = input$domain_seed, n_pcs = npc,
+      inference = "descriptive_only_no_pixel_replicates"), file.path(session_dir, "domain_parameters.csv"), row.names = FALSE)
   })
+  output$domain_gate <- renderUI(if (is.null(state$domains)) tags$div(class = "alert alert-warning", "No labels or generated domains are currently loaded.") else NULL)
+  output$domain_plot <- renderPlot({ req(state$domains); ggplot(state$domains, aes(x, y, color = domain_label)) + geom_point(size = .7) + coord_equal() + scale_y_reverse() + theme_minimal() })
+  output$domain_counts <- renderDT({ req(state$domain_counts); datatable(state$domain_counts, options = list(dom = "t")) })
+  output$domain_features <- renderDT({ req(state$domain_features); datatable(state$domain_features, options = list(pageLength = 10)) })
+  output$domain_download <- renderUI(if (!is.null(state$domains)) downloadButton("download_domains", "Download domain CSV") else NULL)
+  output$download_domains <- downloadHandler(filename = function() "spatial_domains.csv", content = function(file) { req(state$domains); write.csv(state$domains, file, row.names = FALSE) })
 
-  observe({
-    columns <- feature_columns(pixel_matrix())
-    choices <- setNames(columns, sub("^mz_", "", columns))
-    current <- intersect(manual_selected(), columns)
-    manual_selected(current)
-    updateCheckboxGroupInput(session, "manual_features", choices = choices, selected = current)
+  output$moran_action <- renderUI({
+    if (!isTRUE(state$valid) || !isTRUE(state$validation$capabilities$moran)) return(tags$div(class = "alert alert-secondary", "Moran's I is disabled until MSI input is validated."))
+    if (is.null(state$processed)) return(tags$div(class = "alert alert-warning", "Process MSI first."))
+    actionButton("run_moran", "Run Moran's I", class = "btn-primary")
   })
-
-  observeEvent(input$manual_features, {
-    manual_selected(input$manual_features %||% character())
+  observeEvent(input$run_moran, {
+    req(state$processed, state$analysis_matrix); keep <- if (is.null(state$tissue_mask)) rep(TRUE, nrow(state$analysis_matrix)) else state$tissue_mask
+    coordinates <- state$processed$coordinates[keep, , drop = FALSE]; matrix <- state$analysis_matrix[keep, , drop = FALSE]
+    threshold <- if (input$neighbor_method == "queen") sqrt(2) else 1
+    state$neighbors <- build_spatial_neighbors(coordinates$x, coordinates$y, input$neighbor_method, threshold)
+    pixel <- data.frame(coordinates[c("pixel_id", "sample_id", "section_id", "x", "y")], matrix, check.names = FALSE)
+    names(pixel)[-(1:5)] <- state$processed$feature_metadata$column_name
+    state$moran <- compute_spatially_variable_metabolites(pixel, coordinates, n_perm = input$permutations,
+      alternative = "two.sided", p_adjust_method = "BH", seed = 20260807, neighbors = state$neighbors)
+    write.csv(state$moran, file.path(session_dir, paste0("moran_", input$neighbor_method, ".csv")), row.names = FALSE)
   })
-
-  output$feature_stats <- renderUI({
-    req(input$feature)
-    values <- selection_preprocessed()$matrix[[input$feature]]
-    row <- data.frame(
-      mean = mean(values, na.rm = TRUE),
-      cv = {
-        mu <- mean(values, na.rm = TRUE)
-        if (!is.finite(mu) || mu == 0) 0 else stats::sd(values, na.rm = TRUE) / mu
-      },
-      nonzero_rate = mean(values > 0, na.rm = TRUE)
-    )
-    tags$div(
-      tags$b("Feature statistics for selection input"),
-      tags$p(sprintf("Mean: %.4g", row$mean)),
-      tags$p(sprintf("CV: %.4g", row$cv)),
-      tags$p(sprintf("Non-zero rate: %.1f%%", 100 * row$nonzero_rate))
-    )
+  observeEvent(input$load_moran, {
+    validate(need(!is.null(state$processed), "Process the current MSI before attaching a previous result."))
+    directory <- normalizePath(input$moran_result_dir, mustWork = FALSE)
+    path <- file.path(directory, paste0("spatially_variable_metabolites_", input$neighbor_method, ".csv"))
+    validate(need(file.exists(path), "The selected adjacency result CSV was not found.")); state$moran <- read.csv(path, check.names = FALSE)
   })
+  output$moran_gate <- renderUI(if (is.null(state$moran)) tags$div(class = "alert alert-warning", "No Moran result is loaded for the current MSI.") else NULL)
+  output$neighbor_table <- renderDT({ req(state$neighbors); datatable(spatial_neighbor_diagnostics(state$neighbors), options = list(pageLength = 10)) })
+  output$moran_table <- renderDT({ req(state$moran); datatable(head(state$moran[order(state$moran$adj_p_value, -abs(state$moran$morans_i)), ], 100), options = list(pageLength = 10)) })
+  output$ion_plot <- renderPlot({ req(state$moran, state$processed); i <- which.max(state$moran$morans_i); column <- state$moran$feature[i]
+    d <- data.frame(state$processed$coordinates, intensity = state$analysis_matrix[, match(column, state$processed$feature_metadata$column_name)])
+    ggplot(d, aes(x, y, color = intensity)) + geom_point(size = .7) + coord_equal() + scale_y_reverse() + scale_color_viridis_c() + theme_minimal() + labs(title = paste("Top Moran feature", column)) })
 
-  output$ion_plot <- renderPlot({
-    req(input$feature)
-    plot_ion_image(pixel_matrix(), input$feature) + scale_fill_viridis(option = "viridis")
-  })
-
-  output$thumbnail_page_control <- renderUI({
-    total_pages <- max(1, ceiling(length(feature_columns(pixel_matrix())) / 16))
-    tagList(
-      numericInput("thumb_page", "Thumbnail page", value = 1, min = 1, max = total_pages, step = 1),
-      tags$small(sprintf("Total pages: %s", total_pages))
-    )
-  })
-
-  output$thumbnail_plot <- renderPlot({
-    req(input$render_thumbnails)
-    pm <- pixel_matrix()
-    fcols <- feature_columns(pm)
-    total_pages <- max(1, ceiling(length(fcols) / 16))
-    page <- max(1, min(input$thumb_page, total_pages))
-    columns <- fcols[((page - 1) * 16 + 1):min(page * 16, length(fcols))]
-    validate(need(length(columns) > 0, "No features on this page."))
-    long <- tidyr::pivot_longer(pm, cols = tidyselect::all_of(columns), names_to = "feature", values_to = "intensity")
-    selected_features_on_page <- intersect(manual_selected(), columns)
-    selected_panels <- data.frame(
-      feature = selected_features_on_page,
-      xmin = rep(-Inf, length(selected_features_on_page)),
-      xmax = rep(Inf, length(selected_features_on_page)),
-      ymin = rep(-Inf, length(selected_features_on_page)),
-      ymax = rep(Inf, length(selected_features_on_page)),
-      stringsAsFactors = FALSE
-    )
-
-    plot <- ggplot(long, aes(x = x, y = y, fill = intensity)) +
-      geom_raster() +
-      facet_wrap(~feature, ncol = 4) +
-      coord_fixed() +
-      scale_y_reverse() +
-      scale_fill_viridis(option = "viridis") +
-      theme_void(base_size = 10) +
-      theme(strip.text = element_text(size = 8))
-
-    if (nrow(selected_panels) > 0) {
-      plot <- plot +
-        geom_rect(
-          data = selected_panels,
-          aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
-          inherit.aes = FALSE,
-          fill = NA,
-          color = "#D62728",
-          linewidth = 1.2
-        )
-    }
-
-    plot
-  })
-
-  observeEvent(input$thumbnail_click, {
-    clicked_feature <- input$thumbnail_click$panelvar1
-    last_dblclick <- last_thumbnail_dblclick()
-    seconds_since_dblclick <- as.numeric(difftime(Sys.time(), last_dblclick$time, units = "secs"))
-    if (identical(clicked_feature, last_dblclick$feature) && seconds_since_dblclick < 1) {
-      return()
-    }
-    if (!is.null(clicked_feature) && clicked_feature %in% feature_columns(pixel_matrix())) {
-      updateSelectInput(session, "feature", selected = clicked_feature)
-      next_selected <- union(manual_selected(), clicked_feature)
-      manual_selected(next_selected)
-      updateCheckboxGroupInput(
-        session,
-        "manual_features",
-        selected = next_selected
-      )
-    }
-  })
-
-  observeEvent(input$thumbnail_dblclick, {
-    clicked_feature <- input$thumbnail_dblclick$panelvar1
-    if (!is.null(clicked_feature) && clicked_feature %in% feature_columns(pixel_matrix())) {
-      last_thumbnail_dblclick(list(feature = clicked_feature, time = Sys.time()))
-      updateSelectInput(session, "feature", selected = clicked_feature)
-      next_selected <- setdiff(manual_selected(), clicked_feature)
-      manual_selected(next_selected)
-      updateCheckboxGroupInput(
-        session,
-        "manual_features",
-        selected = next_selected
-      )
-    }
-  })
-
-  output$selection_run_status <- renderText(selection_run_status())
-
-  selection_stage <- eventReactive(input$run_selection, {
-    selection_run_status("Running...")
-    update_stage_progress(selection_progress_state, 0.01, "Starting feature selection")
-    tryCatch(
-      withProgress(message = "Feature selection", value = 0, {
-        pm <- pixel_matrix()
-        setProgress(0.1, detail = "Loading unfiltered pixel matrix")
-        update_stage_progress(selection_progress_state, 0.1, "Loading unfiltered pixel matrix")
-        selection_input <- list(matrix = pm, distributions = NULL, background_stats = NULL)
-        setProgress(0.55, detail = "Applying feature-selection rules")
-        update_stage_progress(selection_progress_state, 0.55, "Applying feature-selection rules")
-        selected <- if (identical(input$input_mode, "serial") && "section_id" %in% names(pm)) {
-          select_shared_features(
-            pixel_matrix = pm,
-            feature_mapping = feature_mapping(),
-            min_section_fraction = input$min_section_fraction,
-            cv_top_percent = input$cv_top,
-            mean_min = input$mean_min,
-            nonzero_min = input$nonzero_min,
-            manual_columns = manual_selected(),
-            combine_mode = input$combine_mode
-          )
-        } else {
-          select_features(
-            pixel_matrix = pm,
-            feature_mapping = feature_mapping(),
-            cv_top_percent = input$cv_top,
-            mean_min = input$mean_min,
-            nonzero_min = input$nonzero_min,
-            manual_columns = manual_selected(),
-            combine_mode = input$combine_mode
-          )
-        }
-        setProgress(0.85, detail = "Building reduced matrix")
-        update_stage_progress(selection_progress_state, 0.85, "Building reduced matrix")
-        reduced <- reduce_pixel_matrix(pm, selected)
-        setProgress(1, detail = "Feature selection complete")
-        update_stage_progress(selection_progress_state, 1, "Feature selection complete", "success")
-        selection_run_status(paste0("Complete: ", nrow(selected), " features selected"))
-        list(normalized = selection_input, selected = selected, reduced = reduced)
-      }),
-      error = function(e) {
-        update_stage_progress(selection_progress_state, 1, paste0("Failed: ", conditionMessage(e)), "failed")
-        selection_run_status(paste0("Failed: ", conditionMessage(e)))
-        stop(conditionMessage(e), call. = FALSE)
+  output$lcms_action <- renderUI(if (isTRUE(state$valid) && isTRUE(state$validation$capabilities$lcms))
+    actionButton("load_lcms", "Read precursor window", class = "btn-primary") else tags$div(class = "alert alert-secondary", "LC-MS/MS evidence is disabled. Supply and validate an mzML file."))
+  observeEvent(input$load_lcms, {
+    req(state$valid); withProgress(message = "Reading target MS2 window", value = .1, {
+      state$lcms <- read_mzml_fragment_spectra(state$spec$lcms_path, input$lcms_precursor, 10); incProgress(.9)
+      if (nrow(state$lcms$precursor_scan_metadata)) {
+        state$lcms$precursor_scan_metadata$msi_to_reference_ppm <- (input$msi_mz - input$lcms_precursor) / input$lcms_precursor * 1e6
+        write.csv(state$lcms$precursor_scan_metadata, file.path(session_dir, "precursor_scan_metadata.csv"), row.names = FALSE)
+        write.csv(state$lcms$fragment_peak_table, file.path(session_dir, "fragment_peak_table.csv"), row.names = FALSE)
       }
-    )
-  }, ignoreNULL = TRUE)
-
-  selection_preprocessed <- reactive(selection_stage()$normalized)
-  selected_features <- reactive(selection_stage()$selected)
-  reduced_matrix <- reactive(selection_stage()$reduced)
-  observeEvent(selection_stage(), {
-    preprocess_run_status("New selection ready — click Confirm & run preprocessing")
-    cluster_run_status("Upstream result changed — rerun preprocessing, then K-means")
-    roi_run_status("Upstream result changed — rerun preprocessing, K-means, and ROI sampling")
-  }, ignoreInit = TRUE)
-
-  output$selected_count <- renderText(sprintf("Selected features: %s", nrow(selected_features())))
-  output$selected_table <- renderDT(datatable(selected_features(), options = list(pageLength = 10)))
-  output$download_selected <- download_csv(selected_features, "selected_features.csv")
-  output$download_reduced <- download_csv(reduced_matrix, "reduced_matrix.csv")
-
-  output$preprocess_run_status <- renderText(preprocess_run_status())
-
-  preprocess_stage <- reactiveVal(NULL)
-
-  observeEvent(input$run_preprocess, {
-    preprocess_run_status("Running...")
-    update_stage_progress(preprocess_progress_state, 0.01, "Starting preprocessing")
-    session$onFlushed(function() {
-      shiny::withReactiveDomain(session, {
-      isolate({
-      result <- tryCatch(
-        withProgress(message = "Preprocessing", value = 0, {
-          setProgress(0.15, detail = "Loading selected feature matrix")
-          update_stage_progress(preprocess_progress_state, 0.15, "Loading selected feature matrix")
-          rm <- reduced_matrix()
-          setProgress(0.35, detail = "Applying background removal and normalization")
-          update_stage_progress(preprocess_progress_state, 0.35, "Applying background removal and normalization")
-          processed <- if (identical(input$input_mode, "serial") && "section_id" %in% names(rm)) {
-            preprocess_sections(
-              rm,
-              do_background = input$do_background,
-              background_method = input$background_method,
-              background_percent = input$background_percent,
-              background_percentile = input$background_percentile,
-              min_nonzero_features = input$min_nonzero_features,
-              do_tic = input$do_tic,
-              do_log = input$do_log,
-              do_scale = input$do_scale,
-              scale_scope = "global"
-            )
-          } else {
-            preprocess_matrix(
-              rm,
-              do_background = input$do_background,
-              background_method = input$background_method,
-              background_percent = input$background_percent,
-              background_percentile = input$background_percentile,
-              min_nonzero_features = input$min_nonzero_features,
-              do_tic = input$do_tic,
-              do_log = input$do_log,
-              do_scale = input$do_scale
-            )
-          }
-          setProgress(1, detail = "Preprocessing complete")
-          update_stage_progress(preprocess_progress_state, 1, "Preprocessing complete", "success")
-          preprocess_run_status(paste0("Complete: ", nrow(processed$matrix), " pixels"))
-          processed
-        }),
-        error = function(e) {
-          message <- conditionMessage(e)
-          if (!nzchar(message)) message <- "Run Step 3 feature selection before preprocessing."
-          update_stage_progress(preprocess_progress_state, 1, paste0("Failed: ", message), "failed")
-          preprocess_run_status(paste0("Failed: ", message))
-          showNotification(message, type = "error", duration = NULL)
-          NULL
-        }
-      )
-      if (!is.null(result)) preprocess_stage(result)
-      })
-      })
-    }, once = TRUE)
-  }, ignoreInit = TRUE)
-
-  preprocessed <- reactive({
-    req(preprocess_stage())
-    preprocess_stage()
+    })
   })
-  observeEvent(preprocess_stage(), {
-    cluster_run_status("New preprocessing result ready — click Confirm & run K-means")
-    roi_run_status("Upstream result changed — rerun K-means and ROI sampling")
-  }, ignoreInit = TRUE)
+  output$lcms_gate <- renderUI(if (is.null(state$lcms)) tags$div(class = "alert alert-warning", "No LC-MS/MS target window has been read.") else NULL)
+  output$precursor_table <- renderDT({ req(state$lcms); datatable(state$lcms$precursor_scan_metadata, options = list(scrollX = TRUE)) })
+  output$fragment_plot <- renderPlot({ req(state$lcms); d <- state$lcms$fragment_peak_table
+    validate(need(nrow(d) > 0, "No target-precursor MS2 scan was found in this file."))
+    ggplot(d, aes(fragment_mz, fragment_intensity)) + geom_segment(aes(xend = fragment_mz, yend = 0)) + facet_wrap(~scan_id, scales = "free_y") + theme_minimal() + labs(title = "Unassigned fragment spectrum", x = "fragment m/z", y = "intensity") })
 
-  output$preprocess_hist <- renderPlot({
-    distributions <- preprocessed()$distributions
-    if (is.null(distributions)) {
-      hist_data <- reduced_matrix()
-      values <- unlist(hist_data[, feature_columns(hist_data), drop = FALSE], use.names = FALSE)
-      values <- values[is.finite(values)]
-      return(
-        ggplot(data.frame(value = values), aes(x = value)) +
-          geom_histogram(bins = 60, fill = "#356B6F", color = "white") +
-          labs(title = "Reduced matrix intensity distribution", x = "Intensity", y = "Count") +
-          theme_minimal()
-      )
-    }
-    plot_data <- do.call(rbind, lapply(names(distributions), function(step) {
-      values <- distributions[[step]]
-      data.frame(step = step, value = values[is.finite(values)])
-    }))
-    ggplot(plot_data, aes(x = value)) +
-      geom_histogram(bins = 60, fill = "#356B6F", color = "white") +
-      facet_wrap(~step, scales = "free") +
-      theme_minimal()
-  })
-  output$download_preprocessed <- download_csv(function() preprocessed()$matrix, "preprocessed_matrix.csv")
-
-  output$cluster_run_status <- renderText(cluster_run_status())
-
-  cluster_stage <- eventReactive(input$run_clustering, {
-    cluster_run_status("Running...")
-    update_stage_progress(cluster_progress_state, 0.01, "Starting K-means clustering")
-    tryCatch(
-      withProgress(message = "K-means clustering", value = 0, {
-        pm <- preprocessed()$matrix
-        pca_n <- if (isTRUE(input$use_pca_cluster)) input$pca_components else NULL
-        setProgress(0.1, detail = "Preparing clustering matrix")
-        update_stage_progress(cluster_progress_state, 0.1, "Preparing clustering matrix")
-        setProgress(0.25, detail = "Running K-means")
-        update_stage_progress(cluster_progress_state, 0.25, "Running K-means")
-        clustered_result <- cluster_pixels(pm, k = input$k, pca_components = pca_n)
-        setProgress(0.65, detail = "Calculating elbow diagnostics")
-        update_stage_progress(cluster_progress_state, 0.65, "Calculating elbow diagnostics")
-        diagnostics <- cluster_diagnostics(pm, max_k = 10, pca_components = pca_n)
-        setProgress(1, detail = "Clustering complete")
-        update_stage_progress(cluster_progress_state, 1, "Clustering complete", "success")
-        cluster_run_status(paste0("Complete: k = ", input$k, "; ", nrow(clustered_result$matrix), " pixels"))
-        list(clustered = clustered_result, diagnostics = diagnostics)
-      }),
-      error = function(e) {
-        update_stage_progress(cluster_progress_state, 1, paste0("Failed: ", conditionMessage(e)), "failed")
-        cluster_run_status(paste0("Failed: ", conditionMessage(e)))
-        stop(conditionMessage(e), call. = FALSE)
-      }
-    )
-  }, ignoreNULL = TRUE)
-
-  clustered <- reactive(cluster_stage()$clustered)
-  cluster_diagnostics_result <- reactive(cluster_stage()$diagnostics)
-  observeEvent(cluster_stage(), {
-    roi_run_status("New cluster result ready — define/confirm ROI and run sampling")
-  }, ignoreInit = TRUE)
-  output$cluster_plot <- renderPlot({
-    cm <- clustered()$matrix
-    ggplot(cm, aes(x = x, y = y, fill = factor(cluster))) +
-      geom_tile() +
-      coord_fixed() +
-      scale_y_reverse() +
-      scale_fill_brewer(palette = "Set2") +
-      labs(fill = "Cluster") +
-      theme_minimal()
-  })
-  output$cluster_diag <- renderPlot({
-    diag <- cluster_diagnostics_result()
-    ggplot(diag, aes(x = k, y = tot_withinss)) +
-      geom_line(color = "#276FBF") +
-      geom_point(size = 2, color = "#276FBF") +
-      scale_x_continuous(breaks = diag$k) +
-      labs(y = "Total within-cluster SS") +
-      theme_minimal()
-  })
-  output$download_clustered <- download_csv(function() clustered()$matrix, "clustered_matrix.csv")
-
-  output$roi_editor_section_picker <- renderUI({
-    cm <- clustered()$matrix
-    choices <- if ("section_id" %in% names(cm)) unique(as.character(cm$section_id)) else ".__single__"
-    selectInput("roi_editor_section", "Section", choices = choices, selected = choices[1])
-  })
-
-  active_roi_section <- reactive({
-    value <- input$roi_editor_section
-    if (is.null(value) || !nzchar(value)) ".__single__" else as.character(value)
-  })
-
-  observeEvent(list(input$roi_editor_section, input$manual_roi_method), {
-    draft_polygon(data.frame(x = numeric(), y = numeric()))
-    circle_center(NULL)
-    session$resetBrush("roi_editor_brush")
-  }, ignoreInit = TRUE)
-
-  observeEvent(input$roi_editor_click, {
-    click <- input$roi_editor_click
-    req(click$x, click$y)
-    if (identical(input$manual_roi_method, "draw_polygon")) {
-      draft <- draft_polygon()
-      draft_polygon(rbind(draft, data.frame(x = click$x, y = click$y)))
-    } else if (identical(input$manual_roi_method, "draw_circle")) {
-      circle_center(c(x = click$x, y = click$y))
-    }
-  })
-
-  roi_label_available <- function(label, section) {
-    geometry_key <- drawn_geometry()
-    polygon_key <- drawn_polygons()
-    any(geometry_key$section_id == section & geometry_key$roi_id == label) ||
-      any(polygon_key$section_id == section & polygon_key$roi_id == label)
-  }
-
-  observeEvent(input$add_manual_roi, {
-    method <- input$manual_roi_method
-    if (!method %in% c("draw_rectangle", "draw_circle", "draw_polygon")) return()
-    section <- active_roi_section()
-    label <- trimws(input$roi_editor_id %||% "")
-    if (!nzchar(label)) label <- paste0("roi_manual_", next_roi_order())
-    if (roi_label_available(label, section)) {
-      showNotification("This ROI label already exists in the active section.", type = "error")
-      return()
-    }
-    order_id <- next_roi_order()
-
-    if (identical(method, "draw_rectangle")) {
-      brush <- input$roi_editor_brush
-      if (is.null(brush)) {
-        showNotification("Drag a rectangle on the map first.", type = "error")
-        return()
-      }
-      row <- data.frame(
-        section_id = section, roi_id = label, shape = "rectangle",
-        x_min = min(brush$xmin, brush$xmax), x_max = max(brush$xmin, brush$xmax),
-        y_min = min(brush$ymin, brush$ymax), y_max = max(brush$ymin, brush$ymax),
-        center_x = NA_real_, center_y = NA_real_, size = NA_real_, radius = NA_real_,
-        definition_order = order_id, stringsAsFactors = FALSE
-      )
-      drawn_geometry(rbind(drawn_geometry(), row))
-      session$resetBrush("roi_editor_brush")
-    } else if (identical(method, "draw_circle")) {
-      center <- circle_center()
-      radius <- input$roi_circle_radius
-      if (is.null(center) || !is.finite(radius) || radius <= 0) {
-        showNotification("Click a circle center and provide a positive radius.", type = "error")
-        return()
-      }
-      row <- data.frame(
-        section_id = section, roi_id = label, shape = "circle",
-        x_min = NA_real_, x_max = NA_real_, y_min = NA_real_, y_max = NA_real_,
-        center_x = unname(center[["x"]]), center_y = unname(center[["y"]]),
-        size = NA_real_, radius = radius, definition_order = order_id,
-        stringsAsFactors = FALSE
-      )
-      drawn_geometry(rbind(drawn_geometry(), row))
-      circle_center(NULL)
-    } else {
-      vertices <- draft_polygon()
-      if (nrow(vertices) < 3) {
-        showNotification("A polygon needs at least three vertices.", type = "error")
-        return()
-      }
-      vertices$section_id <- section
-      vertices$roi_id <- label
-      vertices$vertex_order <- seq_len(nrow(vertices))
-      vertices$definition_order <- order_id
-      vertices <- vertices[, c("section_id", "roi_id", "vertex_order", "x", "y", "definition_order")]
-      drawn_polygons(rbind(drawn_polygons(), vertices))
-      draft_polygon(data.frame(x = numeric(), y = numeric()))
-    }
-    next_roi_order(order_id + 1L)
-    updateTextInput(session, "roi_editor_id", value = paste0("roi_manual_", order_id + 1L))
-  })
-
-  observeEvent(input$undo_roi_vertex, {
-    draft <- draft_polygon()
-    if (nrow(draft)) draft_polygon(draft[-nrow(draft), , drop = FALSE])
-  })
-
-  observeEvent(input$remove_last_roi, {
-    orders <- c(drawn_geometry()$definition_order, drawn_polygons()$definition_order)
-    if (!length(orders)) return()
-    last <- max(orders)
-    drawn_geometry(drawn_geometry()[drawn_geometry()$definition_order != last, , drop = FALSE])
-    drawn_polygons(drawn_polygons()[drawn_polygons()$definition_order != last, , drop = FALSE])
-  })
-
-  observeEvent(input$clear_manual_rois, {
-    drawn_geometry(drawn_geometry()[FALSE, , drop = FALSE])
-    drawn_polygons(drawn_polygons()[FALSE, , drop = FALSE])
-    draft_polygon(data.frame(x = numeric(), y = numeric()))
-    circle_center(NULL)
-    next_roi_order(1L)
-    updateTextInput(session, "roi_editor_id", value = "roi_manual_1")
-    session$resetBrush("roi_editor_brush")
-  })
-
-  circle_outlines <- function(geometry) {
-    circles <- geometry[geometry$shape == "circle", , drop = FALSE]
-    if (!nrow(circles)) return(data.frame())
-    do.call(rbind, lapply(seq_len(nrow(circles)), function(i) {
-      angle <- seq(0, 2 * pi, length.out = 101)
-      data.frame(
-        roi_id = circles$roi_id[i],
-        x = circles$center_x[i] + circles$radius[i] * cos(angle),
-        y = circles$center_y[i] + circles$radius[i] * sin(angle)
-      )
-    }))
-  }
-
-  output$roi_editor_plot <- renderPlot({
-    cm <- clustered()$matrix
-    section <- active_roi_section()
-    if ("section_id" %in% names(cm)) cm <- cm[as.character(cm$section_id) == section, , drop = FALSE]
-    geometry <- drawn_geometry()
-    geometry <- geometry[geometry$section_id == section, , drop = FALSE]
-    polygons <- drawn_polygons()
-    polygons <- polygons[polygons$section_id == section, , drop = FALSE]
-    draft <- draft_polygon()
-    center <- circle_center()
-
-    plot <- ggplot(cm, aes(x = x, y = y, fill = factor(cluster))) +
-      geom_tile() +
-      coord_fixed() +
-      scale_y_reverse() +
-      scale_fill_brewer(palette = "Set2") +
-      labs(fill = "Cluster", title = paste("ROI editor —", section)) +
-      theme_minimal()
-
-    rectangles <- geometry[geometry$shape == "rectangle", , drop = FALSE]
-    if (nrow(rectangles)) {
-      plot <- plot + geom_rect(
-        data = rectangles,
-        aes(xmin = x_min, xmax = x_max, ymin = y_min, ymax = y_max, color = roi_id),
-        inherit.aes = FALSE,
-        fill = NA,
-        linewidth = 1.2
-      )
-    }
-    circles <- circle_outlines(geometry)
-    if (nrow(circles)) {
-      plot <- plot + geom_path(
-        data = circles,
-        aes(x = x, y = y, color = roi_id, group = roi_id),
-        inherit.aes = FALSE,
-        linewidth = 1.2
-      )
-    }
-    if (nrow(polygons)) {
-      plot <- plot + geom_polygon(
-        data = polygons,
-        aes(x = x, y = y, color = roi_id, group = interaction(section_id, roi_id)),
-        inherit.aes = FALSE,
-        fill = NA,
-        linewidth = 1.2
-      )
-    }
-    if (nrow(draft)) {
-      plot <- plot +
-        geom_path(data = draft, aes(x = x, y = y), inherit.aes = FALSE, color = "#D62728", linewidth = 1) +
-        geom_point(data = draft, aes(x = x, y = y), inherit.aes = FALSE, color = "#D62728", size = 2)
-    }
-    if (!is.null(center)) {
-      preview_angle <- seq(0, 2 * pi, length.out = 101)
-      preview_circle <- data.frame(
-        x = center[["x"]] + input$roi_circle_radius * cos(preview_angle),
-        y = center[["y"]] + input$roi_circle_radius * sin(preview_angle)
-      )
-      plot <- plot +
-        geom_path(
-          data = preview_circle, aes(x = x, y = y), inherit.aes = FALSE,
-          color = "#D62728", linewidth = 1, linetype = "dashed"
-        ) +
-        geom_point(
-        data = data.frame(x = center[["x"]], y = center[["y"]]),
-        aes(x = x, y = y), inherit.aes = FALSE, color = "#D62728", size = 3, shape = 4, stroke = 1.5
-      )
-    }
-    plot
-  })
-
-  output$roi_editor_status <- renderPrint({
-    section <- active_roi_section()
-    geometry <- drawn_geometry()
-    polygons <- drawn_polygons()
-    geometry_count <- sum(geometry$section_id == section)
-    polygon_count <- length(unique(polygons$definition_order[polygons$section_id == section]))
-    cat("Saved ROIs in this section:", geometry_count + polygon_count, "\n")
-    cat("Total saved ROIs:", length(unique(c(geometry$definition_order, polygons$definition_order))), "\n")
-    if (identical(input$manual_roi_method, "draw_polygon")) {
-      cat("Draft polygon vertices:", nrow(draft_polygon()), "\n")
-    }
-    if (identical(input$manual_roi_method, "draw_circle") && !is.null(circle_center())) {
-      cat("Circle center selected; click Add / finish ROI.\n")
-    }
-  })
-
-  output$manual_cluster_picker <- renderUI({
-    if (!identical(input$roi_selection_mode, "manual") || !identical(input$manual_roi_method, "cluster")) return(NULL)
-    clusters <- sort(unique(clustered()$matrix$cluster))
-    checkboxGroupInput("manual_roi_clusters", "Histology clusters", choices = clusters, selected = clusters)
-  })
-
-  output$roi_run_status <- renderText(roi_run_status())
-  output$registration_diagnostics <- renderPrint({
-    info <- registration_info()
-    if (is.null(info)) {
-      cat("No registration diagnostics available.\n")
-    } else {
-      print(info)
-    }
-  })
-
-  roi_sampling_stage <- eventReactive(input$run_roi_sampling, {
-    roi_run_status("Running...")
-    update_stage_progress(roi_progress_state, 0.01, "Starting ROI selection")
-    tryCatch(
-      withProgress(message = "ROI selection and sampling", value = 0, {
-        cm <- clustered()$matrix
-        section_col <- if (identical(input$input_mode, "serial") && "section_id" %in% names(cm)) "section_id" else NULL
-        setProgress(0.1, detail = "Validating ROI definition")
-        update_stage_progress(roi_progress_state, 0.1, "Validating ROI definition")
-        selected <- if (identical(input$roi_selection_mode, "automatic")) {
-          validate(need(
-            is.null(section_col) || length(unique(cm[[section_col]])) == 1,
-            "Automatic serial ROI selection requires coregistration and is reserved for a future version. Use Manual mode for serial sections."
-          ))
-          prior <- read_csv_upload(input$prior_weights_upload)
-          prior_weights <- NULL
-          if (!is.null(prior)) {
-            validate(need(all(c("cluster", "weight") %in% names(prior)), "Prior CSV needs cluster and weight columns."))
-            prior_weights <- stats::setNames(prior$weight, as.character(prior$cluster))
-          }
-          setProgress(0.3, detail = "Optimizing automatic ROIs")
-          update_stage_progress(roi_progress_state, 0.3, "Optimizing automatic ROIs")
-          select_rois(
-            cm,
-            selection_mode = "automatic",
-            roi_size = input$roi_size,
-            shape = input$roi_shape,
-            cluster_column = "cluster",
-            valid_column = NULL,
-            section_column = section_col,
-            prior_weights = prior_weights,
-            score_weights = c(
-              balance = input$balance_weight,
-              coverage = input$coverage_weight,
-              size = input$size_weight
-            ),
-            max_rois = input$max_rois,
-            improvement_threshold = input$roi_tau
-          )
-        } else {
-          manual_method <- input$manual_roi_method
-          interactive_method <- manual_method %in% c("draw_rectangle", "draw_circle", "draw_polygon")
-          geometry <- if (interactive_method) drawn_geometry() else read_csv_upload(input$manual_geometry_upload)
-          polygons <- if (interactive_method) drawn_polygons() else read_csv_upload(input$manual_polygon_upload)
-          backend_method <- if (identical(manual_method, "cluster")) {
-            "cluster"
-          } else if (interactive_method) {
-            "combined"
-          } else if (identical(manual_method, "geometry_csv")) {
-            "geometry"
-          } else {
-            "polygon"
-          }
-          if (identical(backend_method, "cluster")) {
-            validate(need(length(input$manual_roi_clusters) > 0, "Choose at least one cluster."))
-          } else if (identical(backend_method, "geometry")) {
-            validate(need(!is.null(geometry), "Upload an ROI geometry CSV."))
-            registration_info(NULL)
-          } else if (identical(backend_method, "polygon")) {
-            validate(need(!is.null(polygons), "Upload polygon vertices CSV."))
-            if (identical(input$roi_coordinate_space, "histology")) {
-              control_points <- read_csv_upload(input$histology_control_points_upload)
-              validate(need(!is.null(control_points), "Upload H&E control points CSV for histology coordinate mode."))
-              control_points <- validate_histology_control_points(control_points)
-              if ("section_id" %in% names(polygons) && !"section_id" %in% names(control_points)) {
-                stop("Polygon vertices contain section_id but control points do not. Add section_id to control points.", call. = FALSE)
-              }
-              section_col_reg <- if ("section_id" %in% names(control_points)) "section_id" else NULL
-              registration <- fit_histology_msi_registration(control_points, section_column = section_col_reg)
-              polygons <- transform_histology_coordinates(
-                polygons,
-                registration,
-                x_column = "x",
-                y_column = "y",
-                section_column = section_col_reg
-              )
-              registration_info(registration_diagnostics(registration))
-            } else {
-              registration_info(NULL)
-            }
-          } else {
-            validate(need(nrow(geometry) + nrow(polygons) > 0, "Draw and add at least one ROI."))
-            registration_info(NULL)
-          }
-          setProgress(0.3, detail = "Mapping drawn ROI to pixels")
-          update_stage_progress(roi_progress_state, 0.3, "Mapping drawn ROI to pixels")
-          select_rois(
-            cm,
-            selection_mode = "manual",
-            manual_method = backend_method,
-            cluster_column = "cluster",
-            selected_clusters = input$manual_roi_clusters,
-            roi_table = geometry,
-            polygon_vertices = polygons,
-            section_column = if ("section_id" %in% names(polygons)) "section_id" else section_col,
-            overlap = "first"
-          )
-        }
-        setProgress(0.75, detail = "Sampling independent sub-regions")
-        update_stage_progress(roi_progress_state, 0.75, "Sampling independent sub-regions")
-        sampled_result <- sample_subregions(
-          selected$annotated_pixels,
-          grid_size = input$grid_size,
-          min_pixels = input$min_pixels,
-          roi_column = "roi_id",
-          grid_scope = "roi"
-        )
-        setProgress(1, detail = "ROI sampling complete")
-        update_stage_progress(roi_progress_state, 1, "ROI sampling complete", "success")
-        roi_run_status(paste0(
-          "Complete: ", length(unique(selected$selected_pixels$roi_id)),
-          " ROI(s), ", nrow(sampled_result$sample_mapping), " sub-regions"
-        ))
-        list(selection = selected, sampled = sampled_result)
-      }),
-      error = function(e) {
-        update_stage_progress(roi_progress_state, 1, paste0("Failed: ", conditionMessage(e)), "failed")
-        roi_run_status(paste0("Failed: ", conditionMessage(e)))
-        stop(conditionMessage(e), call. = FALSE)
-      }
-    )
-  }, ignoreNULL = TRUE)
-
-  roi_selection <- reactive(roi_sampling_stage()$selection)
-  sampled <- reactive(roi_sampling_stage()$sampled)
-
-  output$roi_status <- renderPrint({
-    selected <- roi_selection()
-    cat("Selected ROI pixels:", nrow(selected$selected_pixels), "\n")
-    cat("ROI count:", length(unique(selected$selected_pixels$roi_id)), "\n")
-    if (!is.null(selected$optimization)) {
-      cat("ROI score:", signif(selected$optimization$score[["roi_score"]], 4), "\n")
-      print(selected$optimization$history, row.names = FALSE)
-    }
-  })
-
-  output$subregion_plot <- renderPlot({
-    ap <- sampled()$annotated_pixels
-    valid <- sampled()$sample_mapping
-    if (nrow(valid) > 0 && all(c("roi_id", "grid_cell") %in% names(valid))) {
-      valid_cells <- interaction(valid$roi_id, valid$grid_cell, drop = TRUE)
-      ap$valid <- interaction(ap$roi_id, ap$grid_cell, drop = TRUE) %in% valid_cells
-    } else {
-      ap$valid <- FALSE
-    }
-
-    base <- pixel_matrix()
-    reference_feature <- input$feature
-    if (is.null(reference_feature) || !reference_feature %in% names(base)) {
-      reference_feature <- feature_columns(base)[1]
-    }
-    validate(need(!is.na(reference_feature) && length(reference_feature) == 1,
-                  "Choose an ion feature in the sidebar for the gray reference image."))
-    if ("section_id" %in% names(ap) && "section_id" %in% names(base)) {
-      base <- base[as.character(base$section_id) %in% unique(as.character(ap$section_id)), , drop = FALSE]
-    }
-    intensity <- as.numeric(base[[reference_feature]])
-    limits <- stats::quantile(intensity[is.finite(intensity)], c(0.02, 0.98), na.rm = TRUE)
-    if (!all(is.finite(limits)) || limits[2] <= limits[1]) limits <- range(intensity, finite = TRUE)
-    if (!all(is.finite(limits)) || limits[2] <= limits[1]) {
-      base$ion_alpha <- 0.25
-    } else {
-      scaled <- (intensity - limits[1]) / diff(limits)
-      base$ion_alpha <- 0.08 + 0.57 * pmax(0, pmin(1, scaled))
-    }
-    roi_centers <- if ("section_id" %in% names(ap)) {
-      stats::aggregate(cbind(x, y) ~ section_id + roi_id, data = ap, FUN = stats::median)
-    } else {
-      stats::aggregate(cbind(x, y) ~ roi_id, data = ap, FUN = stats::median)
-    }
-
-    plot <- ggplot() +
-      geom_tile(
-        data = base,
-        aes(x = x, y = y, alpha = ion_alpha),
-        fill = "grey30"
-      ) +
-      scale_alpha_identity() +
-      geom_tile(
-        data = ap,
-        aes(x = x, y = y, fill = factor(cluster)),
-        alpha = 0.88
-      ) +
-      geom_label(
-        data = roi_centers,
-        aes(x = x, y = y, label = roi_id),
-        fill = "white", alpha = 0.75, size = 3, label.size = 0
-      ) +
-      coord_fixed() +
-      scale_y_reverse() +
-      scale_fill_brewer(palette = "Set2", name = "Histology cluster") +
-      labs(
-        title = paste0("ROI clusters over gray ion reference: ", sub("^mz_", "", reference_feature)),
-        subtitle = paste(sum(ap$valid), "pixels in retained sub-regions;", sum(!ap$valid), "pixels below min_pixels"),
-        x = "x", y = "y"
-      ) +
-      theme_minimal()
-    if ("section_id" %in% names(ap) && length(unique(ap$section_id)) > 1) {
-      plot <- plot + facet_wrap(~section_id, scales = "free")
-    }
-    plot
-  })
-  output$download_sample_matrix <- download_csv(function() sampled()$sample_matrix, "sample_matrix.csv")
-  output$download_sample_mapping <- download_csv(function() sampled()$sample_mapping, "sample_mapping.csv")
-
-  metabo_data <- reactive({
-    bundle <- existing()
-    if (!is.null(bundle) && !is.null(bundle$metaboanalyst_data)) return(bundle$metaboanalyst_data)
-    sm <- sampled()$sample_matrix
-    validate(
-      need(nrow(sm) > 0, "No sub-region samples available. Lower Step 6 min_pixels or grid_size, or check Step 4 background removal."),
-      need(length(feature_columns(sm)) > 0, "No selected feature columns available for MetaboAnalyst export.")
-    )
-    if ("matched_region_label" %in% names(sm)) {
-      make_metaboanalyst_data(sm, group_column = "matched_region_label")
-    } else {
-      make_metaboanalyst_data(sm)
-    }
-  })
-  output$metabo_status <- renderText({
-    sm <- sampled()$sample_matrix
-    if (nrow(sm) == 0) {
-      return("No MetaboAnalyst samples yet. Try lowering Step 6 min_pixels, using a smaller grid_size, or relaxing Step 4 background removal.")
-    }
-    sprintf(
-      "Ready to export: %s sub-region samples x %s features.",
-      nrow(sm),
-      length(feature_columns(sm))
-    )
-  })
-  output$metabo_preview <- renderDT(datatable(head(metabo_data(), 20), options = list(scrollX = TRUE)))
-  output$download_metabo_csv <- download_csv(metabo_data, "metaboanalyst_data.csv")
-  observeEvent(input$save_metabo_local, {
-    stamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
-    output_dir <- file.path(getwd(), "exports", paste0("metaboanalyst_export_", stamp))
-    write_metabo_export_files(output_dir)
-    last_metabo_export_path(output_dir)
-  })
-  output$metabo_local_path <- renderText({
-    path <- last_metabo_export_path()
-    if (is.null(path)) return("")
-    paste("Saved export files to:", path)
-  })
-  output$download_metabo_zip <- downloadHandler(
-    filename = function() "metaboanalyst_export.zip",
-    content = function(file) {
-      temp_dir <- tempfile("metaboanalyst_export_")
-      paths <- write_metabo_export_files(temp_dir)
-      file.copy(paths[["zip"]], file, overwrite = TRUE)
-    }
-  )
-
-  metabo_result <- reactive({
-    result <- read_csv_upload(input$metabo_result)
-    if (is.null(result)) {
-      bundle <- existing()
-      if (!is.null(bundle) && !is.null(bundle$vip)) return(bundle$vip)
-    }
-    normalize_metaboanalyst_result(result, source_name = attr(result, "source_name"))
-  })
-  result_type <- reactive({
-    req(metabo_result())
-    detect_metaboanalyst_result(metabo_result())
-  })
-  output$result_type <- renderText(paste("Detected result type:", result_type()))
-  output$result_preview <- renderDT(datatable(metabo_result(), options = list(pageLength = 10, scrollX = TRUE)))
-
-  output$result_feature_picker <- renderUI({
-    req(metabo_result())
-    if (!result_type() %in% c("vip", "differential")) return(NULL)
-    selectInput("result_feature", "Feature result", choices = metabo_result()$Feature)
-  })
-
-  output$score_picker <- renderUI({
-    req(metabo_result())
-    if (!result_type() %in% c("pca_scores", "plsda_scores")) return(NULL)
-    score_columns <- setdiff(names(metabo_result()), "Sample")
-    selectInput("score_column", "Score", choices = score_columns)
-  })
-
-  output$backmap_plot <- renderPlot({
-    req(metabo_result())
-    if (result_type() %in% c("vip", "differential")) {
-      req(input$result_feature)
-      pm <- pixel_matrix()
-      title <- input$result_feature
-      result_row <- metabo_result()[metabo_result()$Feature == input$result_feature, , drop = FALSE]
-      if ("VIP" %in% names(result_row)) title <- paste0(title, " | VIP=", signif(result_row$VIP[1], 3))
-      if ("p.value" %in% names(result_row)) title <- paste0(title, " | p=", signif(result_row$p.value[1], 3))
-      plot_ion_image(pm, input$result_feature, title = title) + scale_fill_viridis(option = "viridis")
-    } else {
-      req(input$score_column)
-      scores <- backmap_sample_scores(metabo_result(), sampled()$sample_mapping, input$score_column)
-      pm <- merge(pixel_matrix()[, c("pixel_id", "x", "y")], scores, by = "pixel_id", all.x = FALSE)
-      score_midpoint <- stats::median(pm$score, na.rm = TRUE)
-      if (!is.finite(score_midpoint)) score_midpoint <- 0
-      ggplot(pm, aes(x = x, y = y, fill = score)) +
-        geom_tile() +
-        coord_fixed() +
-        scale_y_reverse() +
-        scale_fill_gradient2(
-          low = "#2B6CB0",
-          mid = "white",
-          high = "#C53030",
-          midpoint = score_midpoint
-        ) +
-        theme_minimal()
-    }
-  })
-
-  output$region_boxplot <- renderPlot({
-    req(metabo_result())
-    validate(need(result_type() %in% c("vip", "differential"), "Feature-level results show boxplots here."))
-    req(input$result_feature)
-    sm <- sampled()$sample_matrix
-    group_values <- if ("matched_region_label" %in% names(sm)) {
-      sm$matched_region_label
-    } else if ("roi_id" %in% names(sm)) {
-      sm$roi_id
-    } else {
-      paste0("Region_", sm$cluster)
-    }
-    ggplot(sm, aes(x = group_values, y = .data[[input$result_feature]], color = group_values)) +
-      geom_boxplot(outlier.shape = NA) +
-      geom_jitter(width = 0.15, height = 0) +
-      theme_minimal() +
-      labs(x = "Region", y = input$result_feature, color = "Region")
-  })
-
-  output$score_plot <- renderPlot({
-    req(metabo_result())
-    validate(need(result_type() %in% c("pca_scores", "plsda_scores"), "Sample-level score plots show here."))
-    result <- metabo_result()
-    xcol <- if ("PC1" %in% names(result)) "PC1" else "Comp1"
-    ycol <- if ("PC2" %in% names(result)) "PC2" else "Comp2"
-    result <- merge(result, metabo_data()[, c("Sample", "Group")], by = "Sample", all.x = TRUE)
-    ggplot(result, aes(x = .data[[xcol]], y = .data[[ycol]], color = Group)) +
-      geom_point(size = 3) +
-      theme_minimal()
-  })
-
-  output$permanova_image <- renderImage({
-    bundle <- existing_outputs()
-    file <- file.path(bundle$output_dir, "plots_for_slides", "step11_pairwise_permanova_table.png")
-    validate(need(file.exists(file), "PERMANOVA figure is missing."))
-    list(src = file, contentType = "image/png", width = "100%")
-  }, deleteFile = FALSE)
-
-  output$pca_image <- renderImage({
-    bundle <- existing_outputs()
-    file <- file.path(bundle$output_dir, "plots_for_slides", "step11_pca_score_plot.png")
-    validate(need(file.exists(file), "PCA figure is missing."))
-    list(src = file, contentType = "image/png", width = "100%")
-  }, deleteFile = FALSE)
-
-  output$permanova_table <- renderDT({
-    bundle <- existing_outputs()
-    validate(need(!is.null(bundle$pairwise_permanova), "pairwise_permanova.csv is missing."))
-    datatable(bundle$pairwise_permanova, options = list(pageLength = 10))
+  output$download_gate <- renderUI(if (!isTRUE(state$valid)) tags$div(class = "alert alert-warning", "Validate an analysis before downloading results.") else NULL)
+  output$download_bundle <- downloadHandler(filename = function() paste0("SpatialOmicsMSI-session-", Sys.Date(), ".zip"), content = function(file) {
+    files <- list.files(session_dir, full.names = TRUE, recursive = TRUE); validate(need(length(files) > 0, "Run at least one workflow step first."))
+    old <- setwd(session_dir); on.exit(setwd(old)); utils::zip(file, sub(paste0("^", session_dir, "/"), "", files))
   })
 }
 

@@ -1,4 +1,10 @@
-library(SpatialOmicsMSI)
+if (nzchar(Sys.getenv("_R_CHECK_PACKAGE_NAME_"))) {
+  library(SpatialOmicsMSI)
+} else {
+  source(file.path(getwd(), "R", "msi_pipeline.R"))
+  source(file.path(getwd(), "R", "spatial_registration.R"))
+  source(file.path(getwd(), "R", "roi_selection.R"))
+}
 
 grid <- expand.grid(x = 0:19, y = 0:19)
 grid$pixel_id <- seq_len(nrow(grid))
