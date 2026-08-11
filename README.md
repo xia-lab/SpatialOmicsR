@@ -93,6 +93,21 @@ svg <- compute_spatially_variable_metabolites(
 Input feature columns should be named `mz_*` or be numeric m/z column names.
 Coordinates must be finite and `pixel_id` values must be unique.
 
+## Executable vignette
+
+The package contains one formal, executable vignette for the complete MSI
+workflow. It runs real bundled pixels from import through Moran screening,
+domains, niches, ROI summaries, exploratory statistics and study-matched
+MALDI--LMD-LC-MS/MS validation:
+
+```r
+vignette("spatial_metabolomics_workflow", package = "SpatialOmicsMSI")
+```
+
+The vignette is the code-first reproducible analysis intended for review. The
+Shiny application has a separate [GUI user guide](inst/shiny/spatial_pipeline/USER_GUIDE.md)
+and is not treated as a second package vignette.
+
 ## Shiny application
 
 After installation:
@@ -101,11 +116,27 @@ After installation:
 SpatialOmicsMSI::run_spatial_app()
 ```
 
+On a remote server, either listen locally and use an SSH tunnel, or explicitly
+listen on all interfaces:
+
+```r
+SpatialOmicsMSI::run_spatial_app(
+  host = "0.0.0.0", port = 3838, launch.browser = FALSE
+)
+```
+
 From a source checkout:
 
 ```r
 shiny::runApp("inst/shiny/spatial_pipeline")
 ```
+
+Follow the [Shiny GUI user guide](inst/shiny/spatial_pipeline/USER_GUIDE.md) for
+the ordered workflow, the two ROI paths, example-dataset coverage, remote-server
+access, progress indicators and exports.
+
+The root `app.R` also accepts `SPATIALOMICS_SHINY_HOST` and
+`SPATIALOMICS_SHINY_PORT` environment variables.
 
 Raw example datasets are intentionally excluded from Git. Their expected local
 layout and provenance are documented in
@@ -163,6 +194,7 @@ man/        User-facing function documentation
 tests/      Regression and scientific-boundary tests
 scripts/    Reproducible analysis entry points
 inst/       Shiny application and data-installation instructions
+vignettes/  One executable, code-first package workflow
 ```
 
 ## Citation and license

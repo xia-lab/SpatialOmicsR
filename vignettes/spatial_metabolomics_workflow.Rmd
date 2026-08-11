@@ -1,0 +1,336 @@
+---
+title: "An Executable SpatialOmicsMSI Workflow"
+author: "Spatial Omics Team"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+    number_sections: true
+vignette: >
+  %\VignetteIndexEntry{An Executable SpatialOmicsMSI Workflow}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 7,
+  fig.height = 5,
+  warning = FALSE,
+  message = FALSE
+)
+set.seed(20260811)
+```
+
+# Scope
+
+This is the package's **single executable vignette**. Every table and figure
+below is generated when the vignette is built; screenshots and pre-rendered
+analysis figures are not used.
+
+The compact fixture contains 2,500 measured kidney MSI pixels and 24 real m/z
+features reconstructed from the public METASPACE acquisition
+`2023-12-19_13h02m39s` associated with Kasarla et al. (2025). A fixed measured
+field and a fixed variance-based feature subset are used only to keep package
+installation and vignette execution fast. The generation script is
+`scripts/prepare_vignette_fixture.R`, and provenance is recorded in
+`inst/extdata/kasarla2025/SOURCE.md`.
+
+This example supports a complete MSI computational workflow and a separate
+ROI-level MALDI--LMD-LC-MS/MS validation. It does **not** contain matched
+Visium expression, a registration-ready H&E image, or biological replicates;
+therefore transcriptomic deconvolution, expression ligand--receptor analysis,
+histology registration, and population-level inference are not claimed here.
+
+```{r load-package}
+library(SpatialOmicsMSI)
+
+fixture <- system.file(
+  "extdata", "kasarla2025", "kasarla_kidney_vignette_pixels.csv.gz",
+  package = "SpatialOmicsMSI"
+)
+stopifnot(nzchar(fixture), file.exists(fixture))
+```
+
+# The five-step processing workflow
+
+## 1. Validate and import pixel-level MSI
+
+The input contract is one row per measured pixel, finite `x` and `y`
+coordinates, and numeric columns named `mz_<mass>`. `pixel_id` provides a stable
+join key. The pipeline validates this contract before analysis.
+
+```{r import}
+raw_pixels <- import_peakpicked_msi_csv(fixture)
+c(
+  measured_pixels = nrow(raw_pixels),
+  mz_features = length(feature_columns(raw_pixels)),
+  duplicated_coordinates = sum(duplicated(raw_pixels[c("x", "y")]))
+)
+```
+
+## 2. QC, TIC normalization, and one log transform
+
+The production path performs per-pixel TIC normalization followed by exactly
+one `log10(x + 1)` transform. It returns analysis values separately from
+coordinates and metadata so that downstream joins remain explicit.
+
+```{r preprocess}
+pipeline <- run_spatial_metabolomics_pipeline(
+  fixture,
+  bad_pixel_filter = FALSE,
+  tic_normalize = TRUE,
+  do_log = TRUE,
+  do_scale = FALSE
+)
+unlist(pipeline$qc_summary)
+
+pixels <- merge(
+  pipeline$coordinates,
+  pipeline$pixel_feature_matrix,
+  by = "pixel_id",
+  sort = FALSE
+)
+pixels <- pixels[match(pipeline$pixel_feature_matrix$pixel_id, pixels$pixel_id), ]
+stopifnot(identical(pixels$pixel_id, pipeline$pixel_feature_matrix$pixel_id))
+```
+
+The map below is calculated from a real ion image, without interpolation or
+background filling.
+
+```{r ion-map, fig.cap="Highest-variance real MSI feature in the compact Kasarla kidney field."}
+ion_feature <- feature_columns(pixels)[1]
+ion_values <- pixels[[ion_feature]]
+palette <- hcl.colors(64, "Viridis")
+colour_index <- cut(ion_values, 64, include.lowest = TRUE, labels = FALSE)
+plot(
+  pixels$x, pixels$y,
+  col = palette[colour_index], pch = 15, asp = 1,
+  xlab = "MSI x", ylab = "MSI y", main = ion_feature
+)
+```
+
+## 3. Construct the spatial graph and screen features
+
+Moran's I has two valid roles: it can screen spatially structured features
+before clustering, and the same cached result can later check whether
+differential hits are spatially coherent. Here a symmetric Queen graph and 99
+two-sided permutations make the executable example fast. A final study should
+increase the permutation count (for example, 499 or more) and report its
+attainable p-value resolution.
+
+```{r moran}
+moran <- compute_spatially_variable_metabolites(
+  pixels,
+  n_perm = 99,
+  alternative = "two.sided",
+  neighbor_method = "queen",
+  seed = 20260811
+)
+head(moran[c("feature", "morans_i", "p_value", "adj_p_value", "n_effective")], 8)
+```
+
+For illustration, the twelve highest-ranked features are retained for domain
+detection. This choice is an analysis parameter, not an anatomical assertion.
+
+```{r feature-screen}
+screened_features <- head(moran$feature, 12)
+domain_input <- pixels[c("pixel_id", "x", "y", screened_features)]
+```
+
+## 4. Detect metabolic domains and neighborhood-composition niches
+
+Domains group pixels by their own molecular profiles. Niches instead group
+pixels by the **local composition of surrounding domains**. They are related
+but not interchangeable labels.
+
+```{r domains}
+domains <- cluster_pixels(
+  domain_input,
+  k = 4,
+  pca_components = 8,
+  nstart = 25,
+  seed = 20260811
+)
+domain_pixels <- domains$matrix
+domain_pixels$domain_label <- paste0("domain_", domain_pixels$cluster)
+table(domain_pixels$domain_label)
+```
+
+```{r domain-map, fig.cap="Data-driven metabolic domains; these are not anatomical ground truth."}
+domain_colours <- setNames(
+  hcl.colors(length(unique(domain_pixels$domain_label)), "Dark 3"),
+  sort(unique(domain_pixels$domain_label))
+)
+plot(
+  domain_pixels$x, domain_pixels$y,
+  col = domain_colours[domain_pixels$domain_label], pch = 15, asp = 1,
+  xlab = "MSI x", ylab = "MSI y", main = "Metabolic domains"
+)
+legend("topright", legend = names(domain_colours), fill = domain_colours, bty = "n")
+```
+
+The radius is expressed in this fixture's grid-coordinate units. Hellinger
+transformation is the default for composition vectors because it handles zeros
+without a pseudocount. Pixels below `min_neighbors` would receive `NA` niche
+labels and remain counted in the exclusion summary.
+
+```{r niches}
+niches <- detect_spatial_niches(
+  domain_pixels,
+  domain_column = "domain_label",
+  neighborhood = "radius",
+  radius = 2.01,
+  include_self = TRUE,
+  min_neighbors = 3,
+  transform = "hellinger",
+  k_niches = 3,
+  domain_alignment = "joint",
+  seed = 20260811
+)
+niches$exclusion_summary
+table(niches$matrix$niche_label, useNA = "ifany")
+```
+
+## 5. Define ROIs, sample subregions, and create standard outputs
+
+There are two ROI paths in the package:
+
+1. data-driven ROI selection retains one or more reviewed domains;
+2. coordinate ROI selection applies independently defined rectangles.
+
+This example demonstrates the first path. We retain the two largest domains as
+separate ROI groups, then aggregate local tiles. Selecting domains does not
+refit the clustering.
+
+```{r roi-sampling}
+domain_order <- names(sort(table(domain_pixels$cluster), decreasing = TRUE))
+roi_mapping <- data.frame(
+  cluster = as.integer(domain_order[1:2]),
+  roi_id = c("reviewed_domain_A", "reviewed_domain_B")
+)
+roi_pixels <- define_rois(
+  domain_pixels,
+  mode = "cluster",
+  cluster_mapping = roi_mapping
+)
+
+subregions <- sample_subregions(
+  roi_pixels,
+  grid_size = 5,
+  min_pixels = 8,
+  grid_scope = "roi"
+)
+table(subregions$sample_matrix$roi_id)
+```
+
+The standardized result objects can be written directly without reshaping.
+`make_metaboanalyst_data()` creates a sample-by-feature table with explicit
+group labels; it belongs in MetaboAnalyst's statistical-analysis input, not in
+the one-column peak-list uploader.
+
+```{r standard-outputs}
+metaboanalyst_table <- make_metaboanalyst_data(
+  subregions$sample_matrix,
+  group_column = "roi_id"
+)
+metaboanalyst_table[1:4, 1:6]
+```
+
+# Downstream analysis tasks
+
+## Exploratory ROI differential analysis
+
+Because this compact fixture contains one acquisition field and no independent
+animals, the following p-values are exploratory tile-level summaries and must
+not be presented as population inference. Real cohort analysis should supply
+subject and section columns or use the package's subject-aware spatial model.
+
+```{r differential}
+differential <- suppressWarnings(differential_region_analysis(
+  subregions$sample_matrix,
+  group_column = "roi_id"
+))
+head(differential[c(
+  "feature", "group_a", "group_b", "effect_size", "p_value", "fdr",
+  "inference_unit", "pseudoreplication_warning"
+)], 8)
+```
+
+The precomputed Moran table can now be reused in its second role: spatial
+coherence checking of ROI-associated features. This is supporting evidence,
+not an independent test, because both results use the same MSI field.
+
+```{r differential-moran}
+spatially_checked <- merge(
+  differential,
+  moran[c("feature", "morans_i", "adj_p_value")],
+  by = "feature",
+  suffixes = c("_roi", "_moran")
+)
+spatially_checked <- spatially_checked[order(spatially_checked$fdr), ]
+head(spatially_checked[c("feature", "effect_size", "fdr", "morans_i", "adj_p_value")], 8)
+```
+
+## Study-matched MALDI--LMD-LC-MS/MS spatial validation
+
+Kasarla et al. reported MALDI-MSI and LMD-LC-MS/MS region summaries for kidney
+cortex, medulla, and renal pelvis. These installed tables validate the
+ROI-concordance function independently of the compact pixel-field ROI labels
+above. They are study-matched serial-section measurements, not interchangeable
+pixel-level inputs.
+
+```{r lcms-validation}
+bundle_dir <- system.file("extdata", "kasarla2025", package = "SpatialOmicsMSI")
+maldi_roi <- read.csv(
+  file.path(bundle_dir, "kasarla_kidney_maldi_roi_matrix.csv"),
+  check.names = FALSE
+)
+lmd_lcms_roi <- read.csv(
+  file.path(bundle_dir, "kasarla_kidney_lmd_lcms_roi_matrix.csv"),
+  check.names = FALSE
+)
+feature_mapping <- read.csv(
+  file.path(bundle_dir, "kasarla_kidney_feature_mapping.csv"),
+  check.names = FALSE
+)
+
+concordance <- compare_msi_lcm_quantification(
+  msi_matrix = maldi_roi,
+  lcm_matrix = lmd_lcms_roi,
+  feature_mapping = feature_mapping,
+  id_columns = c("roi_id", "section_id"),
+  method = "spearman",
+  min_pairs = 3
+)
+head(concordance[c(
+  "msi_feature", "lcm_feature", "n_pairs", "correlation", "p_value"
+)], 8)
+```
+
+With only three aggregate anatomical regions, correlations are coarse
+descriptive concordance measures; they do not establish molecular identity or
+replace replicate-aware quantification. The full source and licensing record is
+shipped beside the tables.
+
+# What this vignette does not claim
+
+- Domains and niches are computational structures until independently interpreted.
+- Tiles and pixels are not biological replicates.
+- Accurate m/z alone does not confirm a lipid or metabolite identity.
+- A MetaboAnalyst lipid/pathway upload requires reviewed lipid names or identifiers;
+  the package must not invent them from m/z alone.
+- Cell-type and expression ligand--receptor functions require suitable matched
+  expression or validated label inputs that are not present in this fixture.
+
+The separate Shiny guide documents the graphical workflow and example-dataset
+capabilities. It is intentionally not a second formal package vignette.
+
+<details><summary>Session information</summary>
+
+```{r session-info}
+sessionInfo()
+```
+
+</details>

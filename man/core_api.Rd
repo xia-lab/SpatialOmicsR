@@ -50,7 +50,6 @@
 \alias{preprocess_select_features}
 \alias{reduce_pixel_matrix}
 \alias{registration_diagnostics}
-\alias{run_spatial_app}
 \alias{run_spatial_metabolomics_pipeline}
 \alias{sample_coordinate_rois}
 \alias{sample_matched_regions}

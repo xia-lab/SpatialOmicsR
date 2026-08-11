@@ -36,5 +36,8 @@ Suggests:
     zip,
     jsonlite,
     base64enc,
+    knitr,
+    rmarkdown,
     testthat (>= 3.0.0)
+VignetteBuilder: knitr
 Config/testthat/edition: 3

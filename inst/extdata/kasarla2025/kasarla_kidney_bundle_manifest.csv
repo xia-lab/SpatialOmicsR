@@ -1,0 +1,14 @@
+role,region,replicate,repository,dataset_id,file_name,file_descriptor
+MALDI-MSI kidney section,whole kidney,1,METASPACE,2023-12-19_13h02m39s,231218_SK_labeledkidney_HEXANE_NH4OHwash_NEDC_MALDI_40um,public dataset input imzML+ibd
+LMD-LC-MS/MS,cortex,1,MassIVE,MSV000096852,LMD_Kidney_BasicHexanewashed_Cortex_1.mzML,f.MSV000096852/peak/peaklist files/MzML_Kidney_LMD-ROI-LC-MS/LMD_Kidney_BasicHexanewashed_Cortex_1.mzML
+LMD-LC-MS/MS,cortex,2,MassIVE,MSV000096852,LMD_Kidney_BasicHexanewashed_Cortex_2.mzML,f.MSV000096852/peak/peaklist files/MzML_Kidney_LMD-ROI-LC-MS/LMD_Kidney_BasicHexanewashed_Cortex_2.mzML
+LMD-LC-MS/MS,cortex,3,MassIVE,MSV000096852,LMD_Kidney_BasicHexanewashed_Cortex_3.mzML,f.MSV000096852/peak/peaklist files/MzML_Kidney_LMD-ROI-LC-MS/LMD_Kidney_BasicHexanewashed_Cortex_3.mzML
+LMD-LC-MS/MS,cortex,4,MassIVE,MSV000096852,LMD_Kidney_BasicHexanewashed_Cortex_4.mzML,f.MSV000096852/peak/peaklist files/MzML_Kidney_LMD-ROI-LC-MS/LMD_Kidney_BasicHexanewashed_Cortex_4.mzML
+LMD-LC-MS/MS,medulla,1,MassIVE,MSV000096852,LMD_Kidney_BasicHexanewashed_Medulla_1.mzML,f.MSV000096852/peak/peaklist files/MzML_Kidney_LMD-ROI-LC-MS/LMD_Kidney_BasicHexanewashed_Medulla_1.mzML
+LMD-LC-MS/MS,medulla,2,MassIVE,MSV000096852,LMD_Kidney_BasicHexanewashed_Medulla_2.mzML,f.MSV000096852/peak/peaklist files/MzML_Kidney_LMD-ROI-LC-MS/LMD_Kidney_BasicHexanewashed_Medulla_2.mzML
+LMD-LC-MS/MS,medulla,3,MassIVE,MSV000096852,LMD_Kidney_BasicHexanewashed_Medulla_3.mzML,f.MSV000096852/peak/peaklist files/MzML_Kidney_LMD-ROI-LC-MS/LMD_Kidney_BasicHexanewashed_Medulla_3.mzML
+LMD-LC-MS/MS,medulla,4,MassIVE,MSV000096852,LMD_Kidney_BasicHexanewashed_Medulla_4.mzML,f.MSV000096852/peak/peaklist files/MzML_Kidney_LMD-ROI-LC-MS/LMD_Kidney_BasicHexanewashed_Medulla_4.mzML
+LMD-LC-MS/MS,renal pelvis,1,MassIVE,MSV000096852,LMD_Kidney_BasicHexanewashed_Renalpelvis_1.mzML,f.MSV000096852/peak/peaklist files/MzML_Kidney_LMD-ROI-LC-MS/LMD_Kidney_BasicHexanewashed_Renalpelvis_1.mzML
+LMD-LC-MS/MS,renal pelvis,2,MassIVE,MSV000096852,LMD_Kidney_BasicHexanewashed_Renalpelvis_2.mzML,f.MSV000096852/peak/peaklist files/MzML_Kidney_LMD-ROI-LC-MS/LMD_Kidney_BasicHexanewashed_Renalpelvis_2.mzML
+LMD-LC-MS/MS,renal pelvis,3,MassIVE,MSV000096852,LMD_Kidney_BasicHexanewashed_Renalpelvis_3.mzML,f.MSV000096852/peak/peaklist files/MzML_Kidney_LMD-ROI-LC-MS/LMD_Kidney_BasicHexanewashed_Renalpelvis_3.mzML
+LMD-LC-MS/MS,renal pelvis,4,MassIVE,MSV000096852,LMD_Kidney_BasicHexanewashed_Renalpelvis_4.mzML,f.MSV000096852/peak/peaklist files/MzML_Kidney_LMD-ROI-LC-MS/LMD_Kidney_BasicHexanewashed_Renalpelvis_4.mzML
