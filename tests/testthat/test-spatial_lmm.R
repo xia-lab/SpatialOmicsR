@@ -24,10 +24,29 @@ spatial_samples$mz_100 <-
   unname(subject_effect[spatial_samples$subject_id]) +
   ifelse(spatial_samples$roi_id == "region_b", 2, 0) +
   0.05 * spatial_samples$x_center + stats::rnorm(nrow(spatial_samples), sd = 0.15)
-spatial_samples$mz_200 <-
-  unname(subject_effect[spatial_samples$subject_id]) +
-  0.05 * (spatial_samples$y_center - mean(spatial_samples$y_center)) +
-  stats::rnorm(nrow(spatial_samples), sd = 0.2)
+# Give the second feature an explicit, well-identified exponential spatial
+# covariance within every subject-section field. A nearly pure-noise fixture
+# makes the range parameter weakly identifiable and lets nlme land on different
+# optimizer boundaries across BLAS/compiler builds.
+spatial_samples$mz_200 <- NA_real_
+field_indices <- split(
+  seq_len(nrow(spatial_samples)),
+  interaction(spatial_samples$subject_id, spatial_samples$section_id, drop = TRUE)
+)
+for (index in field_indices) {
+  physical_coordinates <- cbind(
+    50 * spatial_samples$x_center[index],
+    25 * spatial_samples$y_center[index]
+  )
+  distance_matrix <- as.matrix(stats::dist(physical_coordinates))
+  covariance <- 0.2^2 * (
+    0.9 * exp(-distance_matrix / 75) +
+      0.1 * diag(length(index))
+  )
+  spatial_error <- drop(t(chol(covariance)) %*% stats::rnorm(length(index)))
+  spatial_samples$mz_200[index] <-
+    unname(subject_effect[spatial_samples$subject_id[index]]) + spatial_error
+}
 
 fit <- differential_region_analysis_spatial_lmm(
   spatial_samples,
